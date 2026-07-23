@@ -79,6 +79,10 @@ class RenderConfig:
     seed: int = 0
     # ---- rendering toggles --------------------------------------------
     shadows: ShadowMode = "csm"
+    shadow_map_resolution: int = 512        # per-cascade shadow map size (px)
+    shadow_bias_constant: float = 0.2       # depth bias, constant term (texels)
+    shadow_bias_slope: float = 1.0          # depth bias, slope-term multiplier (x clamped ground slope)
+    shadow_bias_override: float | None = None   # explicit world-space bias; wins over constant+slope
     bloom: bool = True
     exposure: float = 1.0
     # ---- point clouds --------------------------------------------------
@@ -144,6 +148,14 @@ class RenderConfig:
             raise ConfigurationError(f"aa='{self.aa}' must be off|fxaa|taa|smaa")
         if self.shadows not in ("off", "csm", "vsm"):
             raise ConfigurationError(f"shadows='{self.shadows}' must be off|csm|vsm")
+        if self.shadow_map_resolution <= 0:
+            raise ConfigurationError(
+                f"shadow_map_resolution must be > 0 (got {self.shadow_map_resolution})"
+            )
+        if self.shadow_bias_constant < 0.0 or self.shadow_bias_slope < 0.0:
+            raise ConfigurationError("shadow_bias_constant/slope must be >= 0")
+        if self.shadow_bias_override is not None and self.shadow_bias_override < 0.0:
+            raise ConfigurationError("shadow_bias_override must be >= 0")
         if self.output_color_space not in ("linear", "sRGB"):
             raise ConfigurationError(
                 f"output_color_space='{self.output_color_space}' must be linear|sRGB"
