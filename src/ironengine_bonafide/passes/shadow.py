@@ -98,8 +98,15 @@ class CsmShadowPass(RenderPass):
         if override is None:
             override = getattr(cfg, "shadow_bias_override", None)
         constant_texels = float(getattr(cfg, "shadow_bias_constant", 0.2))
-        slope_texels = (float(getattr(cfg, "shadow_bias_slope", 1.0)) * 1.5
-                        * ground_slope_texels(light.direction))
+        ground_tan = ground_slope_texels(light.direction)
+        slope_texels = float(getattr(cfg, "shadow_bias_slope", 1.0)) * 1.5 * ground_tan
+        # Per-fragment receiver slope top-up (PBR pass): multiplier matches
+        # the baked coefficient; ``slope_tan_ref`` marks the ground slope the
+        # baked term already covers so only steeper (grazing) receivers —
+        # walls at shallow light — get the excess. Skipped under an explicit
+        # bias override (the override replaces the whole model by contract).
+        frag_slope_scale = 0.0 if override is not None else (
+            float(getattr(cfg, "shadow_bias_slope", 1.0)) * 1.5)
 
         shadow_maps: list[ShadowMap] = []
         for vp_np, z_n, z_f, frustum in cascades:
@@ -119,6 +126,8 @@ class CsmShadowPass(RenderPass):
                 texel_size_world=frustum.texel_size_x, bias_world=baked_world,
                 receiver_bias_ndc=constant_world * frustum.ndc_per_world,
                 ndc_per_world=frustum.ndc_per_world,
+                slope_scale=frag_slope_scale,
+                slope_tan_ref=ground_tan,
             ))
         ctx.targets.shadow_maps = shadow_maps           # type: ignore[attr-defined]
 

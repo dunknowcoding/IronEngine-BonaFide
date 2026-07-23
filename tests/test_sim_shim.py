@@ -296,3 +296,131 @@ def test_patched_sensor_rgb_pose_and_size(monkeypatch) -> None:
     assert img.shape == (12, 16, 3)
     cam_pose = captured["cam"].pose
     np.testing.assert_allclose(cam_pose[:3, 3], [0.0, 0.0, 4.0], atol=1e-9)
+
+
+# --------------------------------------------------------------- soft bodies
+def _mesh_handle(n_verts: int, indices: np.ndarray) -> Any:
+    verts = np.zeros((n_verts, 8), dtype=np.float32)
+    verts[:, 2] = 1.0                                       # flat sheet at z=1
+    verts[:, 5] = 1.0                                       # normals +Z
+    return SimpleNamespace(vertices=verts,
+                           indices=np.asarray(indices, dtype=np.int64).ravel())
+
+
+def _soft_world(n_verts: int, indices: np.ndarray,
+                soft_positions: np.ndarray | None) -> tuple[Any, _ComponentStore]:
+    store = _ComponentStore()
+    handle = _mesh_handle(n_verts, indices)
+    world = SimpleNamespace(
+        graph=_Graph(store),
+        assets=SimpleNamespace(get_mesh=lambda name: handle,
+                               get_point_cloud=lambda name: None),
+        physics=SimpleNamespace(
+            get_soft_body=lambda eid: (
+                SimpleNamespace(positions=soft_positions)
+                if soft_positions is not None else None)),
+    )
+    store.add(1, MeshRenderable(mesh_id="cloth"))
+    store.add(1, Transform(position=np.array([10.0, 0.0, 0.0])))
+    return world, store
+
+
+def test_softbody_deformed_positions_replace_static_mesh() -> None:
+    """A live soft-body instance with a matching particle count supplies the
+    rendered vertex positions (world-space, transform NOT re-applied)."""
+    idx = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    deformed = np.array([[1.0, 2.0, 3.0], [2.0, 2.0, 3.0],
+                         [2.0, 3.0, 4.0], [1.0, 3.0, 3.0]], dtype=np.float32)
+    world, _ = _soft_world(4, idx, deformed)
+    scene = shim._scene_from_world(world)
+    assert len(scene.meshes) == 1
+    np.testing.assert_allclose(scene.meshes[0].positions.numpy(), deformed, atol=1e-6)
+    # Normals recomputed from the deformed quad (not the flat +Z source).
+    n = scene.meshes[0].normals.numpy()
+    assert not np.allclose(n[:, 2], 1.0), "normals must follow the deformation"
+    np.testing.assert_allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-5)
+
+
+def test_softbody_grid_retriangulated_on_count_mismatch() -> None:
+    """Solver-resolution fallback (particle grid ≠ mesh verts): the cloth is
+    re-triangulated as a regular grid so the simulated shape still renders."""
+    idx = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)   # 4-vert mesh
+    grid_pos = np.array([[x, 0.5, z] for z in (0.0, 1.0, 2.0) for x in (0.0, 1.0, 2.0)],
+                        dtype=np.float32)                    # 3×3 XZ cloth grid
+    world, _ = _soft_world(4, idx, grid_pos)
+    scene = shim._scene_from_world(world)
+    assert len(scene.meshes) == 1
+    mesh = scene.meshes[0]
+    assert mesh.positions.shape[0] == 9                      # 3×3 cloth grid
+    assert mesh.indices.shape[0] == 8                        # 2×2 quads × 2 tris
+    np.testing.assert_allclose(mesh.positions.numpy(), grid_pos, atol=1e-6)
+    # Flat XZ-ish grid → unit normals, sensible shading.
+    np.testing.assert_allclose(np.linalg.norm(mesh.normals.numpy(), axis=1),
+                               1.0, atol=1e-5)
+
+
+def test_softbody_absent_state_falls_back_to_static_mesh() -> None:
+    """No live instance (or no physics world at all) → the statically baked
+    mesh renders exactly as before."""
+    idx = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+    world, _ = _soft_world(4, idx, None)                     # instance missing
+    scene = shim._scene_from_world(world)
+    np.testing.assert_allclose(scene.meshes[0].positions.numpy()[0],
+                               [10.0, 0.0, 1.0], atol=1e-6)   # static + transform
+
+    world, _ = _soft_world(4, idx, np.zeros((4, 3), dtype=np.float32))
+    world.physics = None                                     # physics world gone
+    scene = shim._scene_from_world(world)
+    np.testing.assert_allclose(scene.meshes[0].positions.numpy()[0],
+                               [10.0, 0.0, 1.0], atol=1e-6)
+
+    world2, _ = _soft_world(4, idx, np.zeros((5, 3), dtype=np.float32))
+    scene2 = shim._scene_from_world(world2)                  # odd count, no grid
+    np.testing.assert_allclose(scene2.meshes[0].positions.numpy()[0],
+                               [10.0, 0.0, 1.0], atol=1e-6)
+
+
+def test_softbody_real_sim_world_end_to_end() -> None:
+    """Real Sim objects: a World with a draped cloth (particles ≠ mesh verts
+    via the resolution fallback) exposes its live particle state through the
+    gc discovery path — no install_for_world pin required."""
+    pytest.importorskip("ironengine_sim")
+    from ironengine_sim.world.world import World
+
+    w = World()
+    eid = w.graph.spawn("towel") if hasattr(w.graph, "spawn") else None
+    if eid is None:
+        pytest.skip("SceneGraph.spawn not available in this Sim build")
+    import numpy as _np
+
+    from ironengine_sim.assets import MeshHandle
+    from ironengine_sim.world.components import (
+        MeshRenderable,
+        SoftBody,
+        Transform,
+    )
+
+    verts = _np.zeros((4, 8), dtype=_np.float32)
+    verts[:, 2] = 1.0
+    handle = MeshHandle(
+        name="cloth", vertices=verts,
+        indices=_np.array([0, 1, 2, 0, 2, 3], dtype=_np.int64),
+        aabb_min=_np.zeros(3, dtype=_np.float32),
+        aabb_max=_np.ones(3, dtype=_np.float32))
+    w.assets.add_mesh(handle)
+    w.graph.components.add(eid, MeshRenderable(mesh_id="cloth"))
+    w.graph.components.add(eid, Transform(position=np.array([0.0, 1.0, 0.0])))
+    w.graph.components.add(eid, SoftBody(
+        kind="cloth", params={"resolution": 3, "size": 0.6}))
+    inst = w.physics.add_soft_body(
+        eid, w.graph.components.get(eid, SoftBody))
+    assert inst is not None and inst.positions.shape[0] == 9
+
+    # Resolve through the RenderWorld-shaped namespace (graph + assets only),
+    # exactly what the patched sensor path sees without a pin.
+    ns = SimpleNamespace(graph=w.graph, assets=w.assets)
+    scene = shim._scene_from_world(ns)
+    assert len(scene.meshes) == 1
+    np.testing.assert_allclose(scene.meshes[0].positions.numpy(),
+                               inst.positions, atol=1e-6)

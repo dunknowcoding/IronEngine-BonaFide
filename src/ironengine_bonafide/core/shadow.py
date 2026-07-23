@@ -58,6 +58,8 @@ class ShadowMap:
     bias_world: float = 0.0                             # world-space bias baked into ``depth``
     receiver_bias_ndc: float = 0.0                      # config-driven bias applied at sampling
     ndc_per_world: float = 0.0                          # NDC depth units per world unit
+    slope_scale: float = 0.0                            # per-fragment receiver slope multiplier
+    slope_tan_ref: float = 0.0                          # ground tan already covered by the baked term
 
 
 # --------------------------------------------------------------- splits
@@ -345,7 +347,8 @@ def pcf_sample(depth_map: torch.Tensor, uv: torch.Tensor, current_depth: torch.T
                texel_size_world: float | None = None,
                ndc_per_world: float | None = None,
                slope_scale: float = 1.0,
-               slope_tan_max: float = 4.0) -> torch.Tensor:
+               slope_tan_max: float = 4.0,
+               slope_tan_ref: float = 0.0) -> torch.Tensor:
     """Percentage-closer filter sample.
 
     Args:
@@ -363,6 +366,10 @@ def pcf_sample(depth_map: torch.Tensor, uv: torch.Tensor, current_depth: torch.T
         ndc_per_world: NDC depth units per world unit (LightFrustum).
         slope_scale: multiplier for the slope-scaled bias term.
         slope_tan_max: clamp for tan(theta) in the slope term.
+        slope_tan_ref: tan(theta) already covered by bias baked into the
+            depth map (e.g. the horizontal-ground slope term); only the
+            *excess* per-fragment slope above this reference is added, so
+            horizontal receivers are never double-biased.
 
     Returns:
         (...,) light visibility ∈ [0, 1] — 1 = fully lit, 0 = fully shadowed.
@@ -387,6 +394,10 @@ def pcf_sample(depth_map: torch.Tensor, uv: torch.Tensor, current_depth: torch.T
         ndotl = (normals * ld).sum(dim=-1).abs().clamp(min=1e-3, max=1.0)
         tan = ((1.0 - ndotl * ndotl).clamp(min=0.0)).sqrt() / ndotl
         tan = tan.clamp(max=slope_tan_max)
+        if slope_tan_ref > 0.0:
+            # Only top up the *excess* over the slope already baked into the
+            # depth map — horizontal receivers keep exactly the baked term.
+            tan = (tan - float(slope_tan_ref)).clamp(min=0.0)
         bias_t = bias + tan * (float(texel_size_world) * float(ndc_per_world) * slope_scale)
 
     total = torch.zeros_like(current_depth)

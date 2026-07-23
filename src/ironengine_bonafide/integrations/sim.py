@@ -35,6 +35,7 @@ and then converts between the two conventions.
 """
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -193,12 +194,146 @@ def _bake_transform(cache_key: str, positions: np.ndarray, normals: np.ndarray |
     return pos, nrm
 
 
+# --------------------------------------------------------------- soft bodies
+# id(SceneGraph) -> weakref to the owning PhysicsWorld (or the None marker).
+_PHYSICS_BY_GRAPH: dict[int, Any] = {}
+
+
+def _physics_from_world(world: Any) -> Any:
+    """Resolve Sim's PhysicsWorld for a world-like namespace.
+
+    A pinned (``install_for_world``) or hand-passed real ``World`` exposes
+    ``.physics`` directly. The ``RenderWorld.scene``/``.assets`` fallback
+    namespace doesn't, so the PhysicsWorld is discovered once via a bounded
+    gc walk over live objects (``PhysicsWorld.scene is graph``) and cached
+    weakly per scene graph. Returns None when no physics world exists —
+    callers degrade to static meshes.
+    """
+    physics = getattr(world, "physics", None)
+    if physics is not None:
+        return physics
+    graph = getattr(world, "graph", None)
+    if graph is None:
+        return None
+    key = id(graph)
+    if key in _PHYSICS_BY_GRAPH:
+        return _deref(_PHYSICS_BY_GRAPH[key])
+    found: Any = None
+    try:
+        import gc
+        import weakref
+
+        for obj in gc.get_objects():
+            if type(obj).__name__ == "PhysicsWorld" and getattr(obj, "scene", None) is graph:
+                try:
+                    _PHYSICS_BY_GRAPH[key] = weakref.ref(obj)
+                except TypeError:
+                    _PHYSICS_BY_GRAPH[key] = obj          # unweakrefable double
+                found = obj
+                break
+    except Exception:
+        found = None
+    if found is None:
+        _PHYSICS_BY_GRAPH[key] = None
+    return found
+
+
+def _deref(entry: Any) -> Any:
+    """Resolve a _PHYSICS_BY_GRAPH entry (weakref | strong | None)."""
+    import weakref
+
+    if isinstance(entry, weakref.ReferenceType):
+        return entry()
+    return entry
+
+
+def _recompute_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Area-weighted vertex normals for a (possibly deformed) triangle mesh."""
+    pos = np.asarray(positions, dtype=np.float64)
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+    nrm = np.zeros_like(pos)
+    if idx.shape[0] > 0:
+        v0 = pos[idx[:, 0]]; v1 = pos[idx[:, 1]]; v2 = pos[idx[:, 2]]
+        face = np.cross(v1 - v0, v2 - v0)                    # area-weighted
+        for corner in range(3):
+            np.add.at(nrm, idx[:, corner], face)
+    length = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = nrm / np.where(length > 1e-12, length, 1.0)
+    return nrm.astype(np.float32)
+
+
+def _cloth_grid_indices(n_particles: int) -> np.ndarray | None:
+    """Regular r×r grid triangulation for XPBD cloth particles (row-major,
+    ``idx = i * r + j`` with u along +X and v along +Z), wound for +Y
+    normals at spawn. Returns None when ``n_particles`` isn't a square
+    cloth grid (rope chains, torn bodies, …)."""
+    r = int(round(math.sqrt(n_particles)))
+    if r < 2 or r * r != n_particles:
+        return None
+    tris: list[tuple[int, int, int]] = []
+    for i in range(r - 1):
+        for j in range(r - 1):
+            a = i * r + j
+            b = a + 1
+            c = a + r
+            d = c + 1
+            tris.append((a, c, b))
+            tris.append((b, c, d))
+    return np.asarray(tris, dtype=np.int64)
+
+
+def _soft_override(world: Any, eid: int, n_static_verts: int,
+                   ) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """Live soft-body state for an entity, if Sim simulates one.
+
+    Returns ``(world_positions, grid_indices_or_None)``:
+      * particle count == mesh vertex count → keep the authored topology
+        (``grid_indices_or_None is None``), positions come from the solver;
+      * otherwise a square cloth grid is re-triangulated from the solver
+        particles (solver-resolution fallbacks where the authored mesh and
+        the simulated grid diverge);
+      * anything else (no physics, no instance, rope/odd counts) → None,
+        i.e. render the static mesh.
+    """
+    physics = _physics_from_world(world)
+    get_soft = getattr(physics, "get_soft_body", None)
+    if not callable(get_soft):
+        return None
+    try:
+        inst = get_soft(eid)
+    except Exception:
+        return None
+    if inst is None:
+        return None
+    pos = getattr(inst, "positions", None)
+    if pos is None:
+        return None
+    pos = np.asarray(pos, dtype=np.float32)
+    if pos.ndim != 2 or pos.shape[1] != 3 or pos.shape[0] < 3:
+        return None
+    if pos.shape[0] == n_static_verts:
+        return pos, None
+    grid = _cloth_grid_indices(pos.shape[0])
+    if grid is not None:
+        return pos, grid
+    return None
+
+
 def _scene_from_world(world: Any) -> Scene:
     """Translate Sim's SceneGraph into a BonaFide Scene.
 
     Covers Mesh + PointCloud + Light. Full world transforms — own TRS
     composed with every Hierarchy ancestor — are baked into the geometry.
-    Volume / soft body translation follow as Sim's authoring matures.
+
+    Soft bodies: when the entity has a live XPBD soft-body instance in Sim's
+    physics world (``PhysicsWorld.get_soft_body``), the instance's deformed
+    particle positions (world-space) replace the statically baked mesh —
+    matching vertex counts keep the authored topology (normals are
+    recomputed from the deformed triangles); a cloth particle grid whose
+    count no longer matches the mesh (e.g. solver-resolution fallback) is
+    re-triangulated as a regular grid. When no Sim soft state exists (no
+    physics world, solver unavailable, instance not spawned), the entity
+    renders its static mesh exactly as before.
     """
     sim = _sim_world_components()
     Light, MeshRenderable, SurfaceMaterial, Transform = (
@@ -277,6 +412,22 @@ def _scene_from_world(world: Any) -> Scene:
             vcolors = np.ascontiguousarray(
                 np.asarray(vcolors, dtype=np.float32)[:, :3])
         uvs = full[:, 6:8] if full.shape[1] >= 8 else None
+        # Soft-body deformation: a live XPBD soft instance owns this
+        # entity's shape. Its particle positions are world-space and replace
+        # the statically baked mesh (bypassing the transform cache — soft
+        # geometry is dynamic). Matching counts keep the authored topology;
+        # a square cloth grid is re-triangulated (authored attributes that
+        # no longer align are dropped). Normals are recomputed from the
+        # deformed triangles. No Sim soft state → static mesh, unchanged.
+        soft = _soft_override(world, eid, positions.shape[0])
+        if soft is not None:
+            soft_pos, grid_idx = soft
+            positions = soft_pos
+            if grid_idx is not None:
+                idx = grid_idx
+                vcolors = None
+                uvs = None
+            normals = _recompute_normals(positions, idx)
         scene.add(Mesh.from_arrays(
             positions=positions, indices=idx, normals=normals, uvs=uvs,
             colors=vcolors,

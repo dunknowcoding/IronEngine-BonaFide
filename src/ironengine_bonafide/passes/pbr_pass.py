@@ -314,7 +314,9 @@ def _shade_gbuffer(
 
             if lt.cast_shadow and shadow_maps:
                 visibility = _shadow_factor_csm(world_pos, shadow_maps,
-                                                view_depth=view_depth)
+                                                view_depth=view_depth,
+                                                normals=normals,
+                                                light_dir=ldir)
                 radiance = radiance * visibility.unsqueeze(-1)
             out = out + _ggx_brdf(albedo, normals, view, ldir, radiance, f0, metal3, alpha)
 
@@ -365,12 +367,20 @@ def _shade_gbuffer(
 
 
 def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap],
-                       view_depth: torch.Tensor | None = None) -> torch.Tensor:
+                       view_depth: torch.Tensor | None = None,
+                       normals: torch.Tensor | None = None,
+                       light_dir: torch.Tensor | None = None) -> torch.Tensor:
     """Returns visibility ∈ [0, 1]; 1 = fully lit.
 
     The receiver-side depth bias travels with each map
     (``ShadowMap.receiver_bias_ndc``, config-driven, in light NDC) — there
-    is no hidden hard-coded bias here. When ``view_depth`` (positive
+    is no hidden hard-coded bias here. When ``normals`` + ``light_dir`` are
+    supplied (the production GBuffer path), a per-fragment slope-scaled
+    receiver term tops the bias up for receivers steeper than the
+    horizontal-ground slope already baked into the depth map
+    (``ShadowMap.slope_scale`` / ``ShadowMap.slope_tan_ref``) — grazing-lit
+    walls need several texels more bias than floors and otherwise acne.
+    When ``view_depth`` (positive
     camera-space distance per fragment, HxW) is supplied, each fragment is
     evaluated only against the cascade whose ``z_split_near``/``z_split_far``
     range contains it; otherwise the first cascade whose light-space AABB
@@ -381,6 +391,10 @@ def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap],
     ones = torch.ones((flat.shape[0], 1), device=flat.device, dtype=flat.dtype)
     homog = torch.cat([flat, ones], dim=1)
     vd_flat = view_depth.reshape(-1) if view_depth is not None else None
+    nrm_flat = None
+    if normals is not None and light_dir is not None:
+        nrm_flat = normals.reshape(-1, 3)
+        nrm_flat = nrm_flat / (torch.linalg.norm(nrm_flat, dim=-1, keepdim=True) + 1e-9)
 
     for sm in shadow_maps:
         clip = homog @ sm.light_view_proj.T
@@ -397,7 +411,19 @@ def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap],
         uv = (ndc[:, :2] * 0.5 + 0.5)
         cur_z = ndc[:, 2]
         bias = float(getattr(sm, "receiver_bias_ndc", 0.0) or 0.0)
-        lit = pcf_sample(sm.depth, uv, cur_z, bias=bias, radius=1)
+        pcf_kw: dict = {}
+        if nrm_flat is not None and getattr(sm, "slope_scale", 0.0) > 0.0:
+            pcf_kw = dict(
+                normals=nrm_flat, light_dir=light_dir,
+                texel_size_world=float(sm.texel_size_world),
+                ndc_per_world=float(sm.ndc_per_world),
+                slope_scale=float(sm.slope_scale),
+                # Match the ground-slope clamp (core.shadow tan_max=8) so
+                # near-parallel receivers get the full correction they need.
+                slope_tan_max=8.0,
+                slope_tan_ref=float(getattr(sm, "slope_tan_ref", 0.0)),
+            )
+        lit = pcf_sample(sm.depth, uv, cur_z, bias=bias, radius=1, **pcf_kw)
         # First cascade wins per-pixel
         vis_flat = visibility.flatten()
         target = in_cascade & (vis_flat == 1.0)         # only update untouched pixels

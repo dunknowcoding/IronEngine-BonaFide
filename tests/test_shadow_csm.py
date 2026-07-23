@@ -70,6 +70,18 @@ def _plane(size: float) -> Mesh:
                             material=PBRMaterial(albedo=(0.5, 0.5, 0.5), roughness=0.95))
 
 
+def _wall(width: float, height: float, x: float) -> Mesh:
+    """Vertical wall in the YZ plane at ``x``; interior normal faces -X."""
+    p = np.array([[x, 0, -width], [x, 0, width],
+                  [x, height, width], [x, height, -width]], dtype=np.float32)
+    idx = np.array([[0, 2, 1], [0, 3, 2]], dtype=np.int64)
+    normals = np.tile(np.array([[-1.0, 0.0, 0.0]], dtype=np.float32), (4, 1))
+    return Mesh.from_arrays(p, idx, normals=normals,
+                            colors=np.ones((4, 3), dtype=np.float32) * 0.8,
+                            material=PBRMaterial(albedo=(0.8, 0.78, 0.75), roughness=0.9),
+                            name="wall")
+
+
 def _capture_shadow_maps(scene, cam, cfg) -> list:
     grabbed: dict = {}
 
@@ -410,3 +422,103 @@ def test_no_peter_panning_beyond_one_texel() -> None:
         f"shadow starts {gap_texels:.2f} texels from the contact line "
         f"(peter-panning)"
     )
+
+
+def _grazing_wall_scene():
+    """Multi-scale scene with a wall lit at grazing incidence.
+
+    Sun is steep against the ground (small horizontal slope term baked into
+    the depth map) yet nearly parallel to the wall (tan ≈ 6.5 against the
+    wall normal) — exactly the configuration where a ground-only slope bias
+    under-compensates and the wall self-shadows in a texel lattice.
+    """
+    sun = np.array([-0.15, 0.6, -0.78], dtype=np.float64)
+    sun /= np.linalg.norm(sun)
+    scene = (Scene(background=None)
+             .add(_plane(10.0))
+             .add(_wall(10.0, 5.0, 4.0))
+             .add(_cube(0.9, (3.0, 4.4, -4.7)))            # casts onto the wall
+             .add(_cube(0.12, (0.4, 0.06, 1.2)))           # tiny multi-scale prop
+             .add(DirectionalLight(direction=tuple(-sun), intensity=2.0,
+                                   cast_shadow=True)))
+    cam = PerspectiveCamera(position=(-3.0, 2.2, 0.0), look_at=(4.0, 1.6, 0.0),
+                            fov_deg=45.0, far=100.0)
+    return scene, cam, sun
+
+
+def test_no_acne_on_grazing_lit_wall() -> None:
+    """Regression: a wall at grazing light incidence must not self-shadow.
+
+    Pre-fix, the receiver bias only modelled horizontal receivers (ground
+    slope baked into the depth map + constant), so a steep-grazing wall
+    acned across ~14% of its lit area. The per-fragment slope-scaled
+    receiver term (normals + light dir wired from the GBuffer into
+    ``pcf_sample``) must keep acne < 1% against a ray-cast ground truth.
+    """
+    scene, cam, sun = _grazing_wall_scene()
+    cfg = RenderConfig(width=160, height=90, shadows="csm", bloom=False, seed=0)
+    sms = _capture_shadow_maps(scene, cam, cfg)
+    assert sms, "shadow pass produced no maps"
+
+    # Dense receiver grid on the wall's lit interior surface.
+    gy, gz = np.meshgrid(np.linspace(0.2, 4.6, 120), np.linspace(-4.0, 4.0, 160))
+    pts = np.stack([np.full(gy.size, 4.0 - 1e-4), gy.ravel(), gz.ravel()], axis=1)
+    world = torch.from_numpy(pts).float().reshape(120, 160, 3)
+    normals = torch.from_numpy(
+        np.tile(np.array([[-1.0, 0.0, 0.0]], dtype=np.float32), (120, 160, 1)))
+    vis = _shadow_factor_csm(world, sms, normals=normals,
+                             light_dir=torch.tensor(sun, dtype=torch.float32),
+                             ).numpy().ravel()
+
+    pos = np.concatenate([m.positions.numpy() for m in scene.meshes], axis=0).astype(np.float64)
+    off = 0
+    tris = []
+    for m in scene.meshes:
+        tris.append(m.indices.numpy() + off)
+        off += m.positions.shape[0]
+    idx = np.concatenate(tris, axis=0)
+    truth = _raycast_shadow(pts.astype(np.float64), sun, pos, idx)
+
+    pred = vis < 0.5
+    acne = pred & ~truth
+    leak = ~pred & truth
+    assert truth.sum() > 100, "cube must cast a real shadow on the wall"
+    assert acne.mean() < 0.01, f"acne on grazing-lit wall: {acne.mean():.4f}"
+    interior = _binary_erosion(truth.reshape(120, 160), iterations=2).ravel()
+    interior_leak = leak & interior
+    assert interior_leak.sum() / max(1, interior.sum()) < 0.01, (
+        f"missing shadow inside wall umbra: "
+        f"{interior_leak.sum() / max(1, interior.sum()):.4f}"
+    )
+
+
+def test_pbr_pass_wires_gbuffer_normals_into_pcf() -> None:
+    """Wiring regression: the production shading path must feed GBuffer
+    normals + light direction (and the per-cascade slope metadata) into
+    ``pcf_sample``. Pre-fix the slope-scaled receiver bias existed in
+    ``core.shadow`` but was never passed anything — grazing receivers only
+    ever got the horizontal-ground term."""
+    import ironengine_bonafide.passes.pbr_pass as pbr_mod
+
+    scene, cam, sun = _grazing_wall_scene()
+    seen: list[dict] = []
+    orig = pbr_mod.pcf_sample
+
+    def spy(depth_map, uv, current_depth, **kw):            # noqa: ANN001, ANN202
+        seen.append(kw)
+        return orig(depth_map, uv, current_depth, **kw)
+
+    pbr_mod.pcf_sample = spy
+    try:
+        cfg = RenderConfig(width=64, height=36, shadows="csm", bloom=False, seed=0)
+        with Engine.cpu() as eng:
+            render(eng, scene, cam, cfg)
+    finally:
+        pbr_mod.pcf_sample = orig
+    assert seen, "pcf_sample was never called"
+    for kw in seen:
+        assert kw.get("normals") is not None, "GBuffer normals not passed to pcf_sample"
+        assert kw.get("light_dir") is not None, "light direction not passed to pcf_sample"
+        assert kw.get("slope_scale", 0.0) > 0.0, "per-cascade slope scale not wired"
+        assert kw.get("slope_tan_ref", 0.0) > 0.0, "baked-slope reference not wired"
+
