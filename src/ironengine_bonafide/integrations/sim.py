@@ -35,6 +35,7 @@ and then converts between the two conventions.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -108,15 +109,52 @@ def _trs_matrix(tx: Any) -> tuple[np.ndarray, np.ndarray]:
     return m, rot
 
 
+def _sim_world_components() -> Any:
+    """Sim's world component classes, or name-only stubs when Sim isn't
+    installed.
+
+    The bridge looks components up through the (duck-typed) world store;
+    dependency-free world doubles — tests, minimal CI installs — match by
+    class *name*, which the stubs preserve. A real Sim world can only exist
+    when ``ironengine_sim`` is importable, so the fallback never shadows
+    real classes in production use.
+    """
+    try:
+        from ironengine_sim.world.components import (  # type: ignore[import-not-found]
+            Hierarchy,
+            Light,
+            MeshRenderable,
+            SurfaceMaterial,
+            Transform,
+        )
+    except ImportError:
+        class Hierarchy:
+            pass
+
+        class Light:
+            pass
+
+        class MeshRenderable:
+            pass
+
+        class SurfaceMaterial:
+            pass
+
+        class Transform:
+            pass
+
+    return SimpleNamespace(
+        Hierarchy=Hierarchy, Light=Light, MeshRenderable=MeshRenderable,
+        SurfaceMaterial=SurfaceMaterial, Transform=Transform,
+    )
+
+
 def _world_matrix(world: Any, eid: int) -> tuple[np.ndarray, np.ndarray]:
     """Compose the entity's full world transform, walking the Hierarchy
     parent chain (child matrix left-multiplied by each ancestor's TRS).
 
     Returns (4x4 world matrix, 3x3 pure-rotation chain for normals)."""
-    from ironengine_sim.world.components import (  # type: ignore[import-not-found]
-        Hierarchy,
-        Transform,
-    )
+    sim = _sim_world_components()
     comps = world.graph.components
     m = np.eye(4, dtype=np.float64)
     rot = np.eye(3, dtype=np.float64)
@@ -124,12 +162,12 @@ def _world_matrix(world: Any, eid: int) -> tuple[np.ndarray, np.ndarray]:
     seen: set[int] = set()
     while cur is not None and cur not in seen:
         seen.add(cur)
-        tx = comps.get(cur, Transform)
+        tx = comps.get(cur, sim.Transform)
         if tx is not None:
             m_local, rot_local = _trs_matrix(tx)
             m = m_local @ m
             rot = rot_local @ rot
-        hier = comps.get(cur, Hierarchy)
+        hier = comps.get(cur, sim.Hierarchy)
         cur = hier.parent if hier is not None else None
     return m, rot
 
@@ -162,11 +200,9 @@ def _scene_from_world(world: Any) -> Scene:
     composed with every Hierarchy ancestor — are baked into the geometry.
     Volume / soft body translation follow as Sim's authoring matures.
     """
-    from ironengine_sim.world.components import (  # type: ignore[import-not-found]
-        Light,
-        MeshRenderable,
-        SurfaceMaterial,
-        Transform,
+    sim = _sim_world_components()
+    Light, MeshRenderable, SurfaceMaterial, Transform = (
+        sim.Light, sim.MeshRenderable, sim.SurfaceMaterial, sim.Transform,
     )
     try:
         from ironengine_sim.rendering.point_cloud_renderer import (  # type: ignore[import-not-found]
