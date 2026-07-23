@@ -56,6 +56,8 @@ class ShadowMap:
     z_split_far: float                                  # camera-space far of this cascade
     texel_size_world: float = 0.0                       # world units per texel (light X)
     bias_world: float = 0.0                             # world-space bias baked into ``depth``
+    receiver_bias_ndc: float = 0.0                      # config-driven bias applied at sampling
+    ndc_per_world: float = 0.0                          # NDC depth units per world unit
 
 
 # --------------------------------------------------------------- splits
@@ -302,14 +304,16 @@ def compute_receiver_bias_world(texel_size_world: float, *,
 
 def bake_depth_bias(depth: torch.Tensor, frustum: LightFrustum,
                     bias_world: float, *,
-                    receiver_bias_ndc: float = 0.005) -> torch.Tensor:
+                    receiver_bias_ndc: float = 0.0) -> torch.Tensor:
     """Bake a world-space depth bias into a rasterised shadow map.
 
     Adding ``bias_ndc`` to every stored texel is equivalent to the receiver
-    comparing with ``current_depth - (bias_ndc + receiver_bias_ndc)`` — the
-    PBR pass currently subtracts a fixed ``receiver_bias_ndc`` (0.005), so
-    only the *excess* over that amount is baked here, giving an effective
-    total of ``max(receiver_bias_ndc, bias_world in NDC)``. Returns a new
+    comparing with ``current_depth - (bias_ndc + receiver_bias_ndc)``. The
+    CSM pass splits the total bias into a config-driven receiver-side
+    constant (applied by the PBR pass via ``ShadowMap.receiver_bias_ndc``)
+    and a baked slope term; when ``receiver_bias_ndc`` is given here, only
+    the *excess* over it is baked, so the effective total is exactly
+    ``bias_world`` in NDC — never a hidden hard-coded floor. Returns a new
     tensor; ``+inf`` (empty) texels are left untouched.
     """
     bias_ndc = float(bias_world) * frustum.ndc_per_world

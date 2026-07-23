@@ -10,9 +10,10 @@ Quality measures (see ``core.shadow`` for the math):
   * the light ortho frustum is tightened against the scene AABB and snapped
     to whole texels (stable texel grid, no shimmer);
   * a world-space depth bias (constant + worst-case slope, in texel units)
-    is computed per cascade and baked into the depth map — a fixed NDC
-    bias means a different world distance per cascade and breaks far
-    cascades;
+    is computed per cascade; the constant term is applied receiver-side by
+    the PBR pass (``ShadowMap.receiver_bias_ndc``) and the slope term is
+    baked into the depth map — a fixed NDC bias means a different world
+    distance per cascade and breaks far cascades;
   * the bias can be overridden per light (duck-typed ``shadow_bias``
     attribute, world units) or globally via
     ``RenderConfig.shadow_bias_*``.
@@ -84,30 +85,40 @@ class CsmShadowPass(RenderPass):
             scene_bounds=_scene_aabb(ctx),
         )
 
-        # Bias override: per-light attribute wins, then the config override,
-        # else the constant+slope model (all in world units). The slope term
-        # follows the light's elevation so flat receivers stay acne-free
-        # from overhead sun down to grazing golden-hour light.
+        # Bias split. The *constant* term travels receiver-side
+        # (``ShadowMap.receiver_bias_ndc``, config-driven — the PBR pass
+        # applies exactly this, no hidden hard-coded floor); the *slope*
+        # term is baked into the depth map so occluder and receiver shift
+        # together and the contact line stays anchored at grazing light.
+        # The slope coefficient covers the worst PCF radius-1 tap:
+        # (radius + 0.5) * tan(elevation). A per-light ``shadow_bias``
+        # attribute, then ``RenderConfig.shadow_bias_override``, replaces
+        # the whole constant+slope total (world units).
         override = getattr(light, "shadow_bias", None)
         if override is None:
             override = getattr(cfg, "shadow_bias_override", None)
-        slope_texels = (float(getattr(cfg, "shadow_bias_slope", 1.0))
+        constant_texels = float(getattr(cfg, "shadow_bias_constant", 0.2))
+        slope_texels = (float(getattr(cfg, "shadow_bias_slope", 1.0)) * 1.5
                         * ground_slope_texels(light.direction))
 
         shadow_maps: list[ShadowMap] = []
         for vp_np, z_n, z_f, frustum in cascades:
             vp = torch.from_numpy(vp_np).to(device=ctx.backend.device, dtype=torch.float32)
             depth = self._render_scene_depth(ctx, vp, res, res)
-            bias_world = compute_receiver_bias_world(
+            total_world = compute_receiver_bias_world(
                 frustum.texel_size_x,
-                constant_texels=float(getattr(cfg, "shadow_bias_constant", 0.2)),
+                constant_texels=constant_texels,
                 slope_texels=slope_texels,
                 override_world=override,
             )
-            depth = bake_depth_bias(depth, frustum, bias_world)
+            constant_world = min(constant_texels * frustum.texel_size_x, total_world)
+            baked_world = total_world - constant_world
+            depth = bake_depth_bias(depth, frustum, baked_world)
             shadow_maps.append(ShadowMap(
                 light_view_proj=vp, depth=depth, z_split_near=z_n, z_split_far=z_f,
-                texel_size_world=frustum.texel_size_x, bias_world=bias_world,
+                texel_size_world=frustum.texel_size_x, bias_world=baked_world,
+                receiver_bias_ndc=constant_world * frustum.ndc_per_world,
+                ndc_per_world=frustum.ndc_per_world,
             ))
         ctx.targets.shadow_maps = shadow_maps           # type: ignore[attr-defined]
 

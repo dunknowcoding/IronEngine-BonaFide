@@ -145,6 +145,14 @@ class PbrPass(RenderPass):
 
         # ---- Shade -------------------------------------------------
         shadow_maps: list[ShadowMap] = getattr(ctx.targets, "shadow_maps", []) or []
+        view_depth = None
+        if shadow_maps:
+            # Positive camera-space distance per fragment for CSM cascade
+            # selection (view space looks down -Z).
+            vm = ctx.camera.view_matrix()               # type: ignore[attr-defined]
+            fwd = torch.tensor(vm[2, :3], device=world_pos.device,
+                               dtype=world_pos.dtype)
+            view_depth = -(world_pos @ fwd + float(vm[2, 3]))
         shaded = _shade_gbuffer(
             albedo=albedo, world_pos=world_pos, normals=nrm,
             lights=ctx.scene.lights, ibl=ctx.scene.ibl, mask=mask,
@@ -152,6 +160,7 @@ class PbrPass(RenderPass):
             material=mesh.material,
             cam_pos=_camera_position(ctx.camera, albedo.device, albedo.dtype),
             rough=rough_t, metal=metal_t, ao=ao_t,
+            view_depth=view_depth,
         )
         self._composite(ctx, shaded, depth, nrm, instance_id, mask, colors_albedo=albedo)
 
@@ -249,12 +258,14 @@ def _ibl_mips(ibl: IBL, device: torch.device | str, dtype: torch.dtype) -> list[
 def _shade_gbuffer(
     *, albedo, world_pos, normals, lights, ibl, mask, shadow_maps,
     material=None, cam_pos=None, rough=None, metal=None, ao=None,
+    view_depth=None,
 ):                                                                       # type: ignore[no-untyped-def]
     """Apply Cook-Torrance GGX lights + ambient/IBL + CSM shadows to a
     GBuffer (HxWx3 each). ``material`` supplies scalar roughness /
     metallic / emissive; ``rough`` / ``metal`` / ``ao`` are optional
     per-pixel (H, W) overrides from texture maps. ``cam_pos`` is the
-    world-space eye position."""
+    world-space eye position. ``view_depth`` is the optional per-pixel (H, W)
+    positive camera-space distance used for CSM cascade selection."""
     device, dtype = albedo.device, albedo.dtype
     h, w, _ = albedo.shape
     if rough is None:
@@ -302,7 +313,8 @@ def _shade_gbuffer(
             radiance = (col * lt.intensity).expand(albedo.shape)
 
             if lt.cast_shadow and shadow_maps:
-                visibility = _shadow_factor_csm(world_pos, shadow_maps)
+                visibility = _shadow_factor_csm(world_pos, shadow_maps,
+                                                view_depth=view_depth)
                 radiance = radiance * visibility.unsqueeze(-1)
             out = out + _ggx_brdf(albedo, normals, view, ldir, radiance, f0, metal3, alpha)
 
@@ -352,14 +364,23 @@ def _shade_gbuffer(
     return out * mask.unsqueeze(-1)
 
 
-def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap]) -> torch.Tensor:
-    """Returns visibility ∈ [0, 1]; 1 = fully lit. Uses the first cascade
-    that contains the fragment (fragments outside any cascade are lit)."""
+def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap],
+                       view_depth: torch.Tensor | None = None) -> torch.Tensor:
+    """Returns visibility ∈ [0, 1]; 1 = fully lit.
+
+    The receiver-side depth bias travels with each map
+    (``ShadowMap.receiver_bias_ndc``, config-driven, in light NDC) — there
+    is no hidden hard-coded bias here. When ``view_depth`` (positive
+    camera-space distance per fragment, HxW) is supplied, each fragment is
+    evaluated only against the cascade whose ``z_split_near``/``z_split_far``
+    range contains it; otherwise the first cascade whose light-space AABB
+    contains the fragment wins. Fragments outside any cascade stay lit."""
     h, w, _ = world_pos.shape
     visibility = torch.ones((h, w), device=world_pos.device, dtype=world_pos.dtype)
     flat = world_pos.reshape(-1, 3)
     ones = torch.ones((flat.shape[0], 1), device=flat.device, dtype=flat.dtype)
     homog = torch.cat([flat, ones], dim=1)
+    vd_flat = view_depth.reshape(-1) if view_depth is not None else None
 
     for sm in shadow_maps:
         clip = homog @ sm.light_view_proj.T
@@ -367,11 +388,16 @@ def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap]) ->
         in_cascade = ((ndc[:, 0].abs() <= 1.0)
                       & (ndc[:, 1].abs() <= 1.0)
                       & (ndc[:, 2].abs() <= 1.0))
+        if vd_flat is not None:
+            eps = max(0.5 * float(getattr(sm, "texel_size_world", 0.0)), 1e-6)
+            in_cascade = in_cascade & (vd_flat >= float(sm.z_split_near) - eps) \
+                                    & (vd_flat < float(sm.z_split_far) + eps)
         if not torch.any(in_cascade):
             continue
         uv = (ndc[:, :2] * 0.5 + 0.5)
         cur_z = ndc[:, 2]
-        lit = pcf_sample(sm.depth, uv, cur_z, bias=0.005, radius=1)
+        bias = float(getattr(sm, "receiver_bias_ndc", 0.0) or 0.0)
+        lit = pcf_sample(sm.depth, uv, cur_z, bias=bias, radius=1)
         # First cascade wins per-pixel
         vis_flat = visibility.flatten()
         target = in_cascade & (vis_flat == 1.0)         # only update untouched pixels

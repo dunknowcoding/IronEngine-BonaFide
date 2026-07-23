@@ -110,6 +110,21 @@ def _raycast_shadow(points: np.ndarray, sun_dir: np.ndarray,
     return out
 
 
+def _binary_erosion(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """Pure-numpy binary erosion (4-connectivity, border = False).
+
+    Vendored so the strict interior-umbra check always runs — it must not
+    silently degrade to the boundary-tolerant fallback when scipy is absent
+    (e.g. on CI runners).
+    """
+    out = mask.astype(bool)
+    for _ in range(iterations):
+        p = np.pad(out, 1, constant_values=False)
+        out = (p[1:-1, 1:-1] & p[:-2, 1:-1] & p[2:, 1:-1]
+               & p[1:-1, :-2] & p[1:-1, 2:])
+    return out
+
+
 # ------------------------------------------------------- frustum fit (unit)
 def test_fit_covers_all_slice_corners() -> None:
     """Every frustum-slice corner must land inside the light ortho box —
@@ -237,12 +252,16 @@ def test_bake_depth_bias_world_units() -> None:
                            z_extent=20.0, ndc_per_world=0.1)
     depth = torch.tensor([[0.5, float("inf")]])
     out = bake_depth_bias(depth, frustum, bias_world=0.08)   # 0.008 NDC
-    # receiver already subtracts 0.005 → only the excess (0.003) is baked
-    assert out[0, 0].item() == pytest.approx(0.503, abs=1e-6)
+    # Default: the full world-space bias is baked (no hidden receiver floor).
+    assert out[0, 0].item() == pytest.approx(0.508, abs=1e-6)
     assert out[0, 1].item() == float("inf"), "empty texels must stay empty"
-    # A bias smaller than the receiver's fixed bias bakes nothing.
-    out2 = bake_depth_bias(depth, frustum, bias_world=0.01)  # 0.001 NDC
-    assert torch.equal(out2, depth)
+    # When the sampler applies a receiver-side bias, only the excess is baked.
+    out2 = bake_depth_bias(depth, frustum, bias_world=0.08,
+                           receiver_bias_ndc=0.005)
+    assert out2[0, 0].item() == pytest.approx(0.503, abs=1e-6)
+    out3 = bake_depth_bias(depth, frustum, bias_world=0.01,  # 0.001 NDC
+                           receiver_bias_ndc=0.005)
+    assert torch.equal(out3, depth)
 
 
 def test_bias_override_world_units() -> None:
@@ -356,11 +375,9 @@ def test_shadow_darkens_only_where_occluded() -> None:
     assert acne.mean() < 0.01, f"acne on open ground: {acne.mean():.4f}"
     # Interior leaks (away from the penumbra boundary) are bugs; boundary
     # misses within ~1-2 texels are the expected bias/PCF edge behaviour.
-    try:
-        from scipy import ndimage as ndi
-        interior = ndi.binary_erosion(truth.reshape(120, 120), iterations=2).ravel()
-    except ImportError:                                     # pragma: no cover
-        interior = truth
+    # Vendored pure-numpy erosion: the strict interior check must run
+    # identically with or without scipy installed (CI has no scipy).
+    interior = _binary_erosion(truth.reshape(120, 120), iterations=2).ravel()
     interior_leak = leak & interior
     assert interior_leak.sum() / max(1, interior.sum()) < 0.01, (
         f"missing shadow inside umbra: "
