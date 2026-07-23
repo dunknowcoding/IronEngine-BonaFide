@@ -1,0 +1,65 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Environments
+.env
+.env.*
+.venv
+env/
+venv/
+ENV/
+
+# Tooling caches
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project artifacts
+profile_runs/
+*.bnf.cache
+tests/_diff_outputs/
+tests/_render_cache/
+docs/_build/
+site/
+
+# CUDA / Warp build artifacts
+.warp_cache/
+.cupy_cache/
+*.cubin
+*.ptx
+*.fatbin
+
+# Render bundles & generated assets
+*.bnf
+*.bnf.bak
+*.exr.cache
+*.npy.cache
+
+# Native build artifacts / stale quarantine
+native/_stale_build_quarantined/
+*.pyd

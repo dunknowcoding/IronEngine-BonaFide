@@ -1,0 +1,125 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironengine-bonafide"
+version = "0.1.0"
+description = "Differentiable, neural-first Python render engine — CUDA-first with wgpu fallback. Drop-in renderer for IronEngine-3DCreator and IronEngine-Sim."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "DunknowCoding" }]
+keywords = [
+  "rendering", "differentiable-rendering", "gaussian-splatting", "point-cloud",
+  "pbr", "neural-rendering", "cuda", "wgpu", "ironengine",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Graphics :: 3D Rendering",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Core deps. Heavy backends (CUDA, wgpu, USD, OpenVDB) live in extras.
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.4",
+  "loguru>=0.7",
+  "rich>=13.0",
+  "imageio>=2.34",
+  "Pillow>=10.0",
+  "pygltflib>=1.16",
+]
+
+[project.optional-dependencies]
+cuda = [
+  "cupy-cuda12x>=13.0",
+  "warp-lang>=1.4",
+  "gsplat>=1.4",
+  "nvdiffrast>=0.3.3",
+]
+wgpu = [
+  "wgpu>=0.18",
+]
+formats = [
+  "openexr>=3.2 ; platform_system != 'Windows'",
+  "OpenEXR>=3.2 ; platform_system == 'Windows'",
+  "pyktx>=0.0.4",
+  "openvdb>=11.0",
+  "usd-core>=24.0",
+]
+viewers = [
+  "rerun-sdk>=0.18",
+  "polyscope>=2.2",
+]
+dev = [
+  "pytest>=8",
+  "pytest-qt>=4.4",
+  "pyright>=1.1",
+  "ruff>=0.5",
+]
+all = [
+  "cupy-cuda12x>=13.0",
+  "warp-lang>=1.4",
+  "gsplat>=1.4",
+  "nvdiffrast>=0.3.3",
+  "wgpu>=0.18",
+  "pyktx>=0.0.4",
+  "openvdb>=11.0",
+  "usd-core>=24.0",
+  "rerun-sdk>=0.18",
+  "polyscope>=2.2",
+]
+
+[project.scripts]
+bonafide = "ironengine_bonafide.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/DunknowCoding/IronEngine-BonaFide"
+Documentation = "https://github.com/DunknowCoding/IronEngine-BonaFide/blob/main/docs/USER_GUIDE.md"
+Issues = "https://github.com/DunknowCoding/IronEngine-BonaFide/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ironengine_bonafide = [
+  "backends/wgpu/shaders/*.wgsl",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = [
+  "E501",   # line length
+  "E701",   # multi-statement on one line — accepted in tight tensor-math code
+  "E702",   # multi-statement with semicolon — same rationale
+  "N806",   # capitalised local var — allowed for math identifiers (K, P, M…)
+  "N802",   # invalid function name — pytest fixtures sometimes use camelCase
+  "N803",   # invalid argument name — same as above
+  "N812",   # `import F as F` — common torch.nn.functional alias
+  "SIM108", # if-else → ternary — readability call belongs to author
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/ironengine_bonafide/core/backend.py" = ["E402"]   # back-compat alias import below class
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingImports = "warning"   # CUDA / wgpu may not be installed in CI
+include = ["src"]

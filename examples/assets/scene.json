@@ -1,0 +1,7 @@
+{
+  "name": "demo",
+  "lights": [
+    {"kind": "directional", "direction": [-0.4, -1.0, -0.3], "intensity": 3.0}
+  ],
+  "camera": {"position": [2.0, 1.5, 2.0], "look_at": [0.0, 0.5, 0.0], "fov_deg": 45}
+}
