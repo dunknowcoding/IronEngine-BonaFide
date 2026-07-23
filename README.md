@@ -4,6 +4,7 @@
 
 ### An API-only Python render engine — PBR meshes, point clouds, and IBL lighting with a deterministic CPU reference path
 
+[![CI](https://github.com/dunknowcoding/IronEngine-BonaFide/actions/workflows/ci.yml/badge.svg)](https://github.com/dunknowcoding/IronEngine-BonaFide/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)]()

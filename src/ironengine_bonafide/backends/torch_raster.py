@@ -85,11 +85,17 @@ def clip_near_plane(
         # Map each newly created (edge) vertex to a fresh index.
         edge_vid: dict[tuple[int, int], int] = {}
 
-        def edge_vertex(i0: int, i1: int) -> int:
+        def edge_vertex(
+            i0: int,
+            i1: int,
+            # Bind the loop-local cache via a default arg (B023); each loop
+            # iteration gets its own dict.
+            vid_map: dict[tuple[int, int], int] = edge_vid,
+        ) -> int:
             nonlocal next_vid
             key = (i0, i1)
-            if key in edge_vid:
-                return edge_vid[key]
+            if key in vid_map:
+                return vid_map[key]
             w0, w1 = w_l[i0], w_l[i1]
             t = (eps - w0) / (w1 - w0)
             p0 = positions[i0].to(torch.float32)
@@ -97,7 +103,7 @@ def clip_near_plane(
             new_pos.append(p0 + t * (p1 - p0))
             for ai, attr in enumerate(attrs):
                 new_attr[ai].append(attr[i0] + t * (attr[i1] - attr[i0]))
-            edge_vid[key] = next_vid
+            vid_map[key] = next_vid
             next_vid += 1
             return next_vid - 1
 
@@ -274,7 +280,7 @@ def _scan_chunk(
     lc = (lc / lsum).unsqueeze(-1)
 
     flat_s = flat[final]
-    for (at_a, at_b, at_c), buf in zip(attr_tris, out_bufs):
+    for (at_a, at_b, at_c), buf in zip(attr_tris, out_bufs, strict=True):
         vals = la * at_a[ti_s] + lb * at_b[ti_s] + lc * at_c[ti_s]
         bflat = buf.reshape(-1, buf.shape[-1])
         bflat.index_copy_(0, flat_s, vals)
