@@ -17,12 +17,21 @@ Correctness notes (vs. the previous version):
   emissiveFactor maps to ``PBRMaterial.emissive``.
 * ``COLOR_0`` vertex colors are loaded when present.
 
-Texture *maps* (baseColorTexture etc.) are still not sampled by any pass;
-they remain unresolved.
+Embedded **base-color textures are resolved**: PNG/JPEG images carried in the
+GLB binary chunk (``bufferView`` images), as ``data:`` URIs, or referenced by a
+relative URI are decoded to a deterministic temp-cache file and bound to
+``PBRMaterial.albedo_map``, which the CPU PBR pass samples (``baseColorFactor``
+still multiplies, per spec). Normal / metallic-roughness / occlusion /
+emissive texture references, KTX2 sources, sampler wrap/filter modes, and
+``KHR_texture_transform`` are not resolved yet.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import math
+import tempfile
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -110,7 +119,6 @@ def _load_gltf(path: Path) -> tuple[object, list[bytes]]:
             # still have exactly one such buffer; extras use data: URIs).
             buffers.append(gltf.binary_blob() if is_glb else b"")
         elif uri.startswith("data:"):
-            import base64
             _, _, payload = uri.partition(",")
             buffers.append(base64.b64decode(payload))
         else:
@@ -167,17 +175,89 @@ def _iter_mesh_nodes(gltf: object) -> list[tuple[int, np.ndarray]]:
     return out
 
 
+# --------------------------------------------------------------- textures
+_TEX_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+}
+
+
+def _cache_texture_bytes(raw: bytes, glb_path: Path, image_idx: int, mime: str) -> str:
+    """Write embedded image bytes to a deterministic temp-cache file and
+    return its path (``PbrPass`` loads texture maps from filesystem paths).
+
+    The cache key covers the GLB path, image index, and the bytes themselves,
+    so re-loading an unchanged GLB reuses the file and a changed texture never
+    collides with a stale one.
+    """
+    ext = _TEX_EXT.get(mime.lower(), "." + mime.rsplit("/", 1)[-1].replace("x-", ""))
+    key = hashlib.sha1(
+        str(glb_path.resolve()).encode("utf-8") + b"|" + str(image_idx).encode() + b"|" + raw
+    ).hexdigest()[:16]
+    cache_dir = Path(tempfile.gettempdir()) / "ironengine_bonafide_glb_textures"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"{glb_path.stem}_{image_idx}_{key}{ext}"
+    if not out.is_file() or out.stat().st_size != len(raw):
+        out.write_bytes(raw)
+    return str(out)
+
+
+def _base_color_texture_path(gltf: object, buffers: list[bytes], path: Path, pbr: Any) -> str | None:
+    """Resolve ``pbrMetallicRoughness.baseColorTexture`` to a filesystem path
+    the PBR pass can sample, or None when it cannot be resolved.
+
+    Embedded images (GLB ``bufferView`` or ``data:`` URI) are decoded to a
+    temp-cache file; relative URIs resolve against the GLB's folder. Sampler
+    wrap/filter settings and ``KHR_texture_transform`` are ignored — sampling
+    always repeats with bilinear filtering.
+    """
+    info = pbr.baseColorTexture
+    if info is None or info.index is None:
+        return None
+    textures = getattr(gltf, "textures", None) or []
+    images = getattr(gltf, "images", None) or []
+    if info.index >= len(textures):
+        return None
+    src = textures[info.index].source
+    if src is None or src >= len(images):
+        return None
+    img = images[src]
+    if img.uri:
+        if img.uri.startswith("data:"):
+            header, _, payload = img.uri.partition(",")
+            mime = header[len("data:"):].split(";")[0] or "image/png"
+            try:
+                raw = base64.b64decode(payload)
+            except ValueError:
+                return None
+            return _cache_texture_bytes(raw, path, int(src), mime)
+        candidate = path.parent / urllib.parse.unquote(img.uri)
+        return str(candidate) if candidate.is_file() else None
+    if img.bufferView is not None:
+        view = gltf.bufferViews[img.bufferView]                   # type: ignore[attr-defined]
+        buf = buffers[view.buffer]
+        start = view.byteOffset or 0
+        raw = bytes(buf[start:start + view.byteLength])
+        return _cache_texture_bytes(raw, path, int(src), img.mimeType or "image/png")
+    return None
+
+
 # --------------------------------------------------------------- materials
-def _material_for(gltf: object, mat_idx: int | None) -> tuple[PBRMaterial, float, bool]:
+def _material_for(
+    gltf: object, mat_idx: int | None, buffers: list[bytes], path: Path,
+) -> tuple[PBRMaterial, float, bool]:
     """→ (PBRMaterial, baseColor alpha, double_sided)."""
     if mat_idx is None:
         return PBRMaterial(name="default"), 1.0, False
     m = gltf.materials[mat_idx]                               # type: ignore[attr-defined]
     pbr = m.pbrMetallicRoughness
-    albedo = (0.8, 0.8, 0.8)
+    albedo: tuple[float, float, float] | None = None
     alpha = 1.0
     roughness = 0.7
     metallic = 0.0
+    albedo_map: str | None = None
     if pbr is not None:
         if pbr.baseColorFactor is not None:
             albedo = tuple(float(c) for c in pbr.baseColorFactor[:3])  # type: ignore[assignment]
@@ -186,6 +266,11 @@ def _material_for(gltf: object, mat_idx: int | None) -> tuple[PBRMaterial, float
             roughness = float(pbr.roughnessFactor)
         if pbr.metallicFactor is not None:
             metallic = float(pbr.metallicFactor)
+        albedo_map = _base_color_texture_path(gltf, buffers, path, pbr)
+    if albedo is None:
+        # glTF's default baseColorFactor is white — it multiplies the texture.
+        # Only use the neutral gray fallback when there is no texture at all.
+        albedo = (1.0, 1.0, 1.0) if albedo_map else (0.8, 0.8, 0.8)
     emissive = (0.0, 0.0, 0.0)
     if m.emissiveFactor is not None:
         emissive = tuple(float(c) for c in m.emissiveFactor[:3])       # type: ignore[assignment]
@@ -193,7 +278,7 @@ def _material_for(gltf: object, mat_idx: int | None) -> tuple[PBRMaterial, float
         PBRMaterial(
             name=m.name or "default",
             albedo=albedo, roughness=roughness, metallic=metallic,
-            emissive=emissive, two_sided=bool(m.doubleSided),
+            emissive=emissive, albedo_map=albedo_map, two_sided=bool(m.doubleSided),
         ),
         alpha,
         bool(m.doubleSided),
@@ -237,7 +322,7 @@ def load_primitives(path: Path) -> list[GltfPrimitive]:
             else:
                 idx = np.arange(pos.shape[0], dtype=np.int64).reshape(-1, 3)
 
-            material, alpha, double_sided = _material_for(gltf, prim.material)
+            material, alpha, double_sided = _material_for(gltf, prim.material, buffers, path)
             primitives.append(GltfPrimitive(
                 mesh=Mesh.from_arrays(
                     pos, idx, normals=normals, uvs=uvs, colors=colors,

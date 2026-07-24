@@ -30,7 +30,7 @@ RGB plus optional depth, normals, IDs, and albedo sensor outputs.
 
 It is the drop-in renderer for the **IronEngine** family:
 [3DCreator](https://github.com/dunknowcoding/IronEngine-3DCreator) (prompt → point cloud)
-and Sim (3D simulation for RL) integrate through headless-safe shims.
+integrates through a headless-safe shim.
 
 The engine has three backend paths — CUDA (via optional gsplat / nvdiffrast /
 NVIDIA Warp kernels), wgpu-py, and a **pure NumPy/PyTorch CPU reference
@@ -61,6 +61,34 @@ from scenes exported by the IronEngine pipeline.
 *Left: procedural-sky IBL + `envmap` background + cascaded shadow maps +
 vertex-colored GLB assets. Right: warm low-sun IBL, long shadows, and
 texture-mapped plank flooring sampled through the PBR pass.*
+
+---
+
+## 🖼️ Rendering real-world models
+
+Real-world assets loaded straight from disk — PLY, GLB (with embedded
+textures), OBJ+MTL, and colored point clouds — rendered end-to-end by the
+BonaFide CPU backend: auto-framed camera, procedural-sky IBL, `envmap`
+background, CSM shadows, 1280×720.
+
+Full write-up with per-model code: [Gallery](docs/GALLERY.md) ·
+Formats & recipes: [Rendering Files](docs/RENDERING_FILES.md) ·
+Reproduce locally: `python examples/render_external.py`.
+
+| Stanford Bunny (PLY mesh) | Avocado (GLB) |
+|---|---|
+| ![Stanford Bunny rendered by BonaFide](docs/gallery/bunny.png) | ![Khronos Avocado rendered by BonaFide](docs/gallery/avocado.png) |
+| *Stanford 3D Scanning Repository — ascii PLY, 69k tris* | *Khronos sample model, CC0 (Microsoft)* |
+
+| BoomBox (GLB) | KayKit chest (OBJ) |
+|---|---|
+| ![Khronos BoomBox rendered by BonaFide](docs/gallery/boombox.png) | ![KayKit chest rendered by BonaFide](docs/gallery/chest.png) |
+| *Khronos sample model, CC0 (Microsoft)* | *KayKit Dungeon pack, CC0 (Kay Lousberg)* |
+
+| Dolphins point cloud (colored PLY) |
+|---|
+| ![Colored dolphin point cloud rendered by BonaFide](docs/gallery/dolphins.png) |
+| *Ascii PLY point cloud, per-vertex RGB, LOD + surfels — MIT (three.js)* |
 
 ---
 
@@ -105,8 +133,8 @@ out.rgb.save("preview.png", display_ready=True)
 ```
 
 More recipes in [`examples/`](examples/) — GLB/OBJ mesh rendering, point
-clouds, 3DCreator session → image, Sim shim, and an experimental
-differentiable inverse-rendering demo.
+clouds, 3DCreator session → image, and an experimental differentiable
+inverse-rendering demo.
 
 ### Drop into the existing 3DCreator UI
 
@@ -117,19 +145,12 @@ install()
 # 3DCreator's UI now renders through BonaFide. No 3DCreator code changed.
 ```
 
-### Drop into IronEngine-Sim
-
-```python
-from ironengine_bonafide.integrations.sim import install
-install()    # patches ironengine_sim.rendering.RenderWorld — headless-safe
-```
-
 ---
 
 ## 📦 Feature Matrix
 
 Honest status — ✅ means implemented and covered by the test suite
-(74 passed, 10 skipped as of this release); 🚧 means real code exists but
+(119 passed, 10 skipped as of this release); 🚧 means real code exists but
 the path is not production-ready.
 
 | Subsystem | Status | Notes |
@@ -144,11 +165,11 @@ the path is not production-ready.
 | **GLB / glTF loader** | ✅ | Node transforms, `byteStride` interleaved buffers, multi-buffer, normalized `COLOR_0` |
 | **`.iemodel.json` loader** | ✅ | 3DCreator manifest sidecar, schema versions `iemodel/1` and `iemodel/2` |
 | **Asset formats** | ✅ | PLY · PCD · OBJ · GLB · HDR · EXR · PNG/JPG (KTX2 / VDB / USD behind `[formats]`) |
-| **3DCreator + Sim shims** | ✅ | Headless-safe monkey-patch integrations, TRS transform bridging |
+| **3DCreator shim** | ✅ | Headless-safe monkey-patch integration — 3DCreator's UI renders through BonaFide |
 | **Render bundles** | ✅ | `.bnf` scene + camera + config snapshots round-trip for reproducibility |
 | **Sensor outputs** | ✅ | RGB · depth · world normals · instance IDs · GBuffer albedo as `torch.Tensor`s |
 | **Differentiable render** | 🚧 | `render_differentiable()` exists (torch autograd through the CPU path); experimental |
-| **GLB embedded textures** | 🚧 | Texture *references* inside GLBs are not resolved yet — load maps via the API |
+| **GLB embedded textures** | ✅ | Embedded / `data:` / relative-URI **baseColor** textures decode to `albedo_map` — normal/MR/AO/emissive maps, KTX2, and `KHR_texture_transform` not yet |
 | **CUDA kernel extras** | 🚧 | gsplat / nvdiffrast / Warp paths are wired but optional; `Engine.auto()` falls back to CPU when absent |
 | **wgpu WGSL pipelines** | 🚧 | Backend scaffolding present; WGSL pipelines not feature-complete |
 | **TAA / SMAA** | 🚧 | Pass stubs exist; true temporal/smaa anti-aliasing not yet (FXAA works) |
@@ -160,7 +181,7 @@ the path is not production-ready.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ L5  Integrations: 3DCreator shim · Sim shim · CLI · folder mount │
+│ L5  Integrations: 3DCreator shim · CLI · folder mount            │
 ├──────────────────────────────────────────────────────────────────┤
 │ L4  Public API:  render(scene, camera, config) → RenderOutputs   │
 ├──────────────────────────────────────────────────────────────────┤
@@ -183,6 +204,7 @@ reference implementation every other backend is validated against.
 ## 📚 Documentation
 
 - **[User Guide](docs/USER_GUIDE.md)** — installation, scenes, cameras, materials, recipes, troubleshooting
+- **[Rendering Files](docs/RENDERING_FILES.md)** — point clouds & external 3D models: formats, loaders, textures, per-format recipes
 - **[API Reference](docs/API_REFERENCE.md)** — every class, method, and parameter
 - **[Architecture Notes](docs/ARCHITECTURE.md)** — layer-by-layer design rationale
 - **[Performance Notes](docs/PERFORMANCE.md)** — honest comparison vs panda3d / taichi

@@ -8,6 +8,13 @@ Accepts **both** schema generations:
   flags, and ``physics.solid_volume_m3`` / ``mass_kg``. The v1 top-level
   ``material`` (majority fallback) is still emitted by the writer, so it is
   the default ``IEModel.material`` for both schemas.
+* ``iemodel/3`` — superset of v2: adds ``physics.body_type`` and optional
+  top-level ``soft_body`` / ``fracture`` / ``articulation`` / ``cloth``
+  blocks plus a ``textures`` block (``ietexture/1``). The non-rigid blocks
+  are tolerated (ignored) — ``body_type`` flows through ``IEModel.physics``
+  automatically — and the ``textures`` block's ``albedo`` channel is mapped
+  onto ``albedo_map`` of the majority and per-part materials when the
+  referenced PNG exists next to the manifest.
 
 :func:`load_creator_triple` ingests a whole ``creator_model_*`` export —
 manifest + sibling GLB mesh + sibling PLY point cloud — into BonaFide
@@ -26,7 +33,7 @@ from ironengine_bonafide.core.material import PBRMaterial
 from ironengine_bonafide.core.mesh import Mesh
 from ironengine_bonafide.core.pointcloud import PointCloud
 
-_SCHEMAS = ("iemodel/1", "iemodel/2")
+_SCHEMAS = ("iemodel/1", "iemodel/2", "iemodel/3")
 
 
 @dataclass(slots=True)
@@ -92,8 +99,68 @@ def _material_from_block(block: dict[str, Any] | None, name_fallback: str) -> PB
     )
 
 
+def _apply_textures_block(
+    block: Any,
+    base: Path,
+    material: PBRMaterial,
+    materials: dict[str, PBRMaterial],
+    parts: list[IEModelPart],
+) -> None:
+    """Map the iemodel/3 ``textures`` block's albedo channel onto materials.
+
+    The block (``ietexture/1``) is ``{"maps": {id: {"file": ...}},
+    "assignments": [{"part": label, "maps": {"albedo": id, ...}}]}``.
+    Each assignment's albedo file is resolved against the manifest
+    directory; only existing files are attached. The per-part material
+    (matched via the part label) and — from the first resolvable
+    assignment — the majority material get ``albedo_map`` set. Materials
+    that already carry an ``albedo_map`` are left untouched. Any malformed
+    content is ignored silently (tolerant v3 parsing).
+    """
+    if not isinstance(block, dict):
+        return
+    maps = block.get("maps")
+    assignments = block.get("assignments")
+    if not isinstance(maps, dict) or not isinstance(assignments, list):
+        return
+
+    def _albedo_file(map_id: Any) -> Path | None:
+        meta = maps.get(map_id)
+        if not isinstance(meta, dict):
+            return None
+        ref = meta.get("file")
+        if not isinstance(ref, str) or not ref:
+            return None
+        p = (base / ref).resolve()
+        return p if p.is_file() else None
+
+    part_material = {p.label: p.material for p in parts}
+    majority_done = material.albedo_map is not None
+    for rec in assignments:
+        if not isinstance(rec, dict):
+            continue
+        channels = rec.get("maps")
+        if not isinstance(channels, dict):
+            continue
+        tex = _albedo_file(channels.get("albedo"))
+        if tex is None:
+            continue
+        mat_name = part_material.get(str(rec.get("part", "")))
+        target = materials.get(mat_name) if mat_name else None
+        if target is not None and target.albedo_map is None:
+            target.albedo_map = str(tex)
+        if not majority_done:
+            material.albedo_map = str(tex)
+            majority_done = True
+
+
 def load_iemodel(path: str | Path) -> IEModel:
-    """Parse an ``iemodel/1`` or ``iemodel/2`` manifest."""
+    """Parse an ``iemodel/1``, ``iemodel/2`` or ``iemodel/3`` manifest.
+
+    Unknown optional blocks (v3's ``soft_body`` / ``fracture`` /
+    ``articulation`` / ``cloth`` and any future additions) are tolerated —
+    only the fields this loader understands are read.
+    """
     p = Path(path)
     data = json.loads(p.read_text(encoding="utf-8"))
     schema = str(data.get("schema", ""))
@@ -134,6 +201,9 @@ def load_iemodel(path: str | Path) -> IEModel:
         )
         for i, part in enumerate(data.get("parts") or [])
     ]
+
+    # iemodel/3 textures block: map the albedo channel onto materials.
+    _apply_textures_block(data.get("textures"), base, material, materials, parts)
 
     return IEModel(
         path=p,

@@ -7,7 +7,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ L5  Integrations: 3DCreator shim · Sim shim · CLI · folder mount │
+│ L5  Integrations: 3DCreator shim · CLI · folder mount            │
 ├──────────────────────────────────────────────────────────────────┤
 │ L4  Public API:  Engine · Scene · render() / render_diff()       │
 ├──────────────────────────────────────────────────────────────────┤
@@ -101,8 +101,7 @@ seed_everything(seed)
    the *last* pass and only fires when `output_color_space="sRGB"`.
 2. Depth is **OpenGL-style NDC z in [-1, 1]** (+inf where empty), as the
    rasterizers write it. Sensor-facing consumers that need linear meters
-   unproject via `2·near·far / (far + near − z·(far − near))` — the Sim
-   shim's `render_sensor_depth` does this for you.
+   unproject via `2·near·far / (far + near − z·(far − near))`.
 3. IDs start at `0` (background); each Mesh writes its `instance_id` ≥ 1.
 4. Passes never resize `targets`. `NeuralUpscalePass` is the only pass
    permitted to change the output resolution, and it does so by replacing
@@ -131,5 +130,5 @@ seed_everything(seed)
 - **No multi-GPU.** Single `Engine` per process; for batch rendering, spawn
   N processes each owning one Engine.
 - **No CCD / advanced physics.** The render engine is render-only; physics
-  belongs in IronEngine-Sim or NVIDIA Warp solvers.
+  belongs in a downstream simulator or NVIDIA Warp solvers.
 - **No FBX.** Convert to GLB.

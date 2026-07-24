@@ -27,6 +27,12 @@ class PointCloud:
     opacities: torch.Tensor | None = None               # (N,) — default 1.0
     name: str = "pointcloud"
     point_size_px: float = 2.0
+    # When True the splat pass ignores ``point_size_px`` and infers a
+    # world-space disk radius from the cloud's own density (mean inter-
+    # point spacing), so kilometer- and millimeter-scale clouds both
+    # render with sensible splat sizes. ``point_size_px`` stays the
+    # manual override whenever this is False (the default).
+    auto_point_size: bool = False
     # Per-pass enablement flags ----------------------------------------
     use_lod: bool = False
     use_completion: bool = False
@@ -85,6 +91,10 @@ class PointCloud:
 
     def with_gsplat(self, **kw: Any) -> PointCloud:
         return replace(self, use_gsplat=True, **{k: v for k, v in kw.items() if hasattr(self, k)})
+
+    def with_auto_point_size(self, **kw: Any) -> PointCloud:
+        """Enable density-inferred splat sizing (see ``auto_point_size``)."""
+        return replace(self, auto_point_size=True, **{k: v for k, v in kw.items() if hasattr(self, k)})
 
     # --------------------------------------------------------- utilities
     @property

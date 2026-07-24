@@ -58,10 +58,20 @@ _BINARY_TYPE_TO_STRUCT = {
 }
 
 
+def _header_end(raw: bytes) -> int:
+    """Byte offset just past the ``end_header`` line (LF or CRLF tolerant)."""
+    marker = raw.find(b"end_header")
+    if marker == -1:
+        raise ValueError("Not a PLY file (missing `end_header`)")
+    nl = raw.find(b"\n", marker)
+    if nl == -1:
+        raise ValueError("Truncated PLY header")
+    return nl + 1
+
+
 def load_pointcloud(path: Path) -> PointCloud:
     raw = path.read_bytes()
-    # Header is ASCII either way; binary body follows the `end_header\n` marker.
-    header_end = raw.find(b"end_header\n") + len(b"end_header\n")
+    header_end = _header_end(raw)
     header_lines = raw[:header_end].split(b"\n")
     fmt, elements, _ = _parse_header(header_lines)
 
@@ -126,7 +136,7 @@ def load_pointcloud(path: Path) -> PointCloud:
 def load_mesh(path: Path) -> Mesh:
     """Load a PLY *mesh* (vertex + face elements)."""
     raw = path.read_bytes()
-    header_end = raw.find(b"end_header\n") + len(b"end_header\n")
+    header_end = _header_end(raw)
     header_lines = raw[:header_end].split(b"\n")
     fmt, elements, _ = _parse_header(header_lines)
     if fmt != "ascii":

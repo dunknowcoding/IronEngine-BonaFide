@@ -11,11 +11,20 @@ Conventions:
   * NDC z in [-1, 1]; ``+inf`` marks an empty pixel.
   * Triangles crossing the near plane are *split* in clip space
     (``w = eps``) before the perspective divide instead of being dropped;
-    per-vertex attributes are lerped at the clip points.
+    per-vertex attributes are lerped at the clip points. Clip vertices
+    are bisection-verified against the *rounded* float32 position so they
+    can never land back behind the plane (float32 lerp rounding used to
+    push them to ``w < 0``, dropping whole triangles).
   * Attribute interpolation (color / normal / world-pos / uv / tangent)
     is perspective-correct: screen-space barycentrics are weighted by
     ``1/w`` and renormalized per pixel. NDC z stays affine in screen
     space, which is the correct depth to interpolate linearly.
+  * Projection and the whole barycentric scan run in **float64**.
+    Very large triangles at grazing angles project vertices to screen
+    coordinates of ~1e9 px and more; in float32 the edge-function
+    products (~1e18) cancel catastrophically, which produced dotted
+    vertical stripes — or zero coverage when the (equally cancelled)
+    area denominator underflowed the viability threshold.
   * Per-pixel depth resolve is deterministic: ``scatter_reduce(amin)``
     on the flattened depth buffer, then a first-candidate tiebreak for
     the attribute write — no ``argsort`` + duplicate ``index_put_``.
@@ -76,7 +85,52 @@ def clip_near_plane(
 
     inside_l = inside.tolist()
     w_l = clip[:, 3].tolist()
+    w_row = view_proj.to(torch.float64)[3] if cross.shape[0] else None
     next_vid = n
+
+    def _clip_point(i0: int, i1: int) -> tuple[torch.Tensor, float]:
+        """Edge/clip-plane intersection, verified in rounded float32.
+
+        The closed-form ``t`` puts the vertex exactly on ``w = eps``, but
+        casting the lerped position back to float32 can push it across
+        the plane again (for large coordinates the cast error exceeds
+        ``eps``), which used to drop the whole triangle at scan time.
+        When that happens, bracket-bisect ``t`` between the closed-form
+        value and the inside endpoint until the *rounded* position
+        satisfies ``w >= eps``.
+        """
+        w0, w1 = w_l[i0], w_l[i1]
+        t_bad = (eps - w0) / (w1 - w0)
+        t_ok = 0.0 if inside_l[i0] else 1.0
+        p0 = positions[i0].to(torch.float64)
+        p1 = positions[i1].to(torch.float64)
+
+        def _rounded_w(t: float) -> tuple[torch.Tensor, float]:
+            pos32 = (p0 + t * (p1 - p0)).to(torch.float32)
+            w_new = float(
+                w_row[0] * pos32[0].double() + w_row[1] * pos32[1].double()
+                + w_row[2] * pos32[2].double() + w_row[3]
+            )
+            return pos32, w_new
+
+        pos32, w_new = _rounded_w(t_bad)
+        if w_new >= eps:
+            return pos32, t_bad
+        best: tuple[torch.Tensor, float] | None = None
+        for _ in range(24):
+            mid = 0.5 * (t_bad + t_ok)
+            pos32, w_new = _rounded_w(mid)
+            if w_new >= eps:
+                t_ok = mid
+                best = (pos32, mid)
+            else:
+                t_bad = mid
+        if best is not None:
+            return best
+        # Pathological fallback: the inside endpoint itself (w > eps by
+        # construction); degenerate but valid.
+        t_in = 0.0 if inside_l[i0] else 1.0
+        return positions[i0 if inside_l[i0] else i1], t_in
 
     for k in range(cross.shape[0]):
         ids = [int(v) for v in cross[k].tolist()]
@@ -96,11 +150,8 @@ def clip_near_plane(
             key = (i0, i1)
             if key in vid_map:
                 return vid_map[key]
-            w0, w1 = w_l[i0], w_l[i1]
-            t = (eps - w0) / (w1 - w0)
-            p0 = positions[i0].to(torch.float32)
-            p1 = positions[i1].to(torch.float32)
-            new_pos.append(p0 + t * (p1 - p0))
+            pos32, t = _clip_point(i0, i1)
+            new_pos.append(pos32)
             for ai, attr in enumerate(attrs):
                 new_attr[ai].append(attr[i0] + t * (attr[i1] - attr[i0]))
             vid_map[key] = next_vid
@@ -131,7 +182,9 @@ def clip_near_plane(
         out_indices = torch.cat([keep, tri_t], dim=0)
     out_pos = positions
     if new_pos:
-        out_pos = torch.cat([positions, torch.stack(new_pos, dim=0)], dim=0)
+        out_pos = torch.cat(
+            [positions, torch.stack(new_pos, dim=0).to(positions.dtype)], dim=0,
+        )
     out_attrs: list[torch.Tensor] = []
     for ai, attr in enumerate(attrs):
         if new_attr[ai]:
@@ -153,13 +206,21 @@ def _project(
     width: int,
     height: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project world positions. Returns (sx, sy, ndc_z, clip_w)."""
+    """Project world positions. Returns (sx, sy, ndc_z, clip_w), all float64.
+
+    The divide runs in float64: grazing-angle vertices land at screen
+    coordinates of ~1e9 px and beyond, where float32 rounding is visible.
+    ``w`` is clamped to the near-clip viability floor before the divide so
+    clip-plane stragglers (rounding-level, see ``clip_near_plane``) keep a
+    consistent sign and finite coordinates instead of exploding to
+    ``1/1e-6`` in an arbitrary direction.
+    """
     device = positions.device
     n = positions.shape[0]
-    ones = torch.ones((n, 1), dtype=torch.float32, device=device)
-    clip = torch.cat([positions, ones], dim=1) @ view_proj.T
+    ones = torch.ones((n, 1), dtype=torch.float64, device=device)
+    clip = torch.cat([positions.to(torch.float64), ones], dim=1) @ view_proj.to(torch.float64).T
     w = clip[:, 3]
-    inv_w = 1.0 / w.clamp(min=1e-6)
+    inv_w = 1.0 / w.clamp(min=_NEAR_EPS * 0.5)
     ndc = clip[:, :3] * inv_w.unsqueeze(1)
     sx = (ndc[:, 0] * 0.5 + 0.5) * width
     sy = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height
@@ -192,16 +253,18 @@ def _scan_triangles(
     xmax = torch.maximum(torch.maximum(ax, bx), cx).clamp(max=width - 1).ceil().long()
     ymax = torch.maximum(torch.maximum(ay, by), cy).clamp(max=height - 1).ceil().long()
     denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
-    # Clipped vertices sit exactly on w = eps (minus rounding); the
-    # viability threshold must be looser than the clip plane.
-    viable = ((xmax >= xmin) & (ymax >= ymin) & (denom.abs() > 1e-9)
-              & (w[a] > _NEAR_EPS * 0.5) & (w[b] > _NEAR_EPS * 0.5)
-              & (w[c] > _NEAR_EPS * 0.5))
+    # Every surviving triangle passed near-plane clipping, so all corners
+    # are in front modulo float32 rounding on the clip plane; clamp the
+    # 1/w weights to the viability floor instead of rejecting the whole
+    # triangle (rejecting used to erase huge grazing triangles entirely).
+    viable = (xmax >= xmin) & (ymax >= ymin) & (denom.abs() > 1e-9)
     if not torch.any(viable):
         return
     sel = viable.nonzero(as_tuple=False).squeeze(1)
 
-    wa, wb, wc = w[a], w[b], w[c]
+    wa = w[a].clamp(min=_NEAR_EPS * 0.5)
+    wb = w[b].clamp(min=_NEAR_EPS * 0.5)
+    wc = w[c].clamp(min=_NEAR_EPS * 0.5)
     for start in range(0, sel.numel(), _CHUNK):
         chunk = sel[start:start + _CHUNK]
         _scan_chunk(
@@ -227,8 +290,8 @@ def _scan_chunk(
         y0 = int(ymin[t]); y1 = int(ymax[t])
         if x1 < x0 or y1 < y0:
             continue
-        ys = torch.arange(y0, y1 + 1, dtype=torch.float32, device=device)
-        xs = torch.arange(x0, x1 + 1, dtype=torch.float32, device=device)
+        ys = torch.arange(y0, y1 + 1, dtype=ax.dtype, device=device)
+        xs = torch.arange(x0, x1 + 1, dtype=ax.dtype, device=device)
         gy, gx = torch.meshgrid(ys, xs, indexing="ij")
         flat_xs.append(gx.reshape(-1))
         flat_ys.append(gy.reshape(-1))
@@ -243,7 +306,9 @@ def _scan_chunk(
     ws_a = ((by[ti] - cy[ti]) * (xs_f - cx[ti]) + (cx[ti] - bx[ti]) * (ys_f - cy[ti])) * inv_d
     ws_b = ((cy[ti] - ay[ti]) * (xs_f - cx[ti]) + (ax[ti] - cx[ti]) * (ys_f - cy[ti])) * inv_d
     ws_c = 1.0 - ws_a - ws_b
-    tri_z = ws_a * az[ti] + ws_b * bz[ti] + ws_c * cz[ti]
+    # Barycentrics are float64; the depth buffer is float32, so the
+    # interpolated NDC z is cast down only after the precise math.
+    tri_z = (ws_a * az[ti] + ws_b * bz[ti] + ws_c * cz[ti]).to(depth.dtype)
 
     inside = (ws_a >= -1e-6) & (ws_b >= -1e-6) & (ws_c >= -1e-6)
     yi = ys_f.long(); xi = xs_f.long()
@@ -281,7 +346,7 @@ def _scan_chunk(
 
     flat_s = flat[final]
     for (at_a, at_b, at_c), buf in zip(attr_tris, out_bufs, strict=True):
-        vals = la * at_a[ti_s] + lb * at_b[ti_s] + lc * at_c[ti_s]
+        vals = (la * at_a[ti_s] + lb * at_b[ti_s] + lc * at_c[ti_s]).to(buf.dtype)
         bflat = buf.reshape(-1, buf.shape[-1])
         bflat.index_copy_(0, flat_s, vals)
     if mask is not None:
@@ -485,7 +550,8 @@ def raster_points(
     valid = ((px >= 0) & (px < width) & (py >= 0) & (py < height) & (w > _NEAR_EPS))
     if not torch.any(valid):
         return rgb, depth
-    px, py, z, c = px[valid], py[valid], sz[valid], colors[valid]
+    px, py, c = px[valid], py[valid], colors[valid]
+    z = sz[valid].to(depth.dtype)                       # float64 proj → buffer dtype
     eye_d = w[valid]
 
     # Perspective-scaled disk radius (capped to bound the kernel).

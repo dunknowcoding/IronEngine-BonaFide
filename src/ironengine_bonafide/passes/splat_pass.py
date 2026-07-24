@@ -6,8 +6,19 @@ Capability flow:
 
 Each PointCloud in the scene is rendered into the same `targets.rgb` /
 `targets.depth`, with depth testing handled per-backend.
+
+Splat sizing: by default disks use ``cloud.point_size_px`` (diameter at
+1 m eye depth, perspective-scaled). With ``cloud.auto_point_size`` the
+pass instead infers a world-space disk radius from the cloud's own
+density — half the mean inter-point spacing estimated from the bounding
+box — and converts it through the camera's pixel focal length, so clouds
+at any scene scale (millimetres to kilometres) render with visible,
+gap-free splats. The manual ``point_size_px`` override is unchanged when
+``auto_point_size`` is False.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 
@@ -75,15 +86,20 @@ class SplatPass(RenderPass):
             return
 
         h, w = ctx.targets.rgb.shape[:2]
+        # Splat size: manual override by default; density-inferred world
+        # radius when the cloud opts into auto sizing.
+        point_size = cloud.point_size_px
+        if getattr(cloud, "auto_point_size", False):
+            point_size = auto_point_size_px(cloud, ctx.camera, h)
         if use_native:
-            self._render_native_splat(ctx, positions, colors, view_proj, w, h, cloud.point_size_px)
+            self._render_native_splat(ctx, positions, colors, view_proj, w, h, point_size)
             return
 
         # CPU torch disk-splat fallback.
         be = ctx.backend if isinstance(ctx.backend, CpuBackend) else CpuBackend()
         rgb, depth = self._raster_points(
             be, positions.cpu(), colors.cpu(), view_proj.cpu(),
-            w, h, cloud.point_size_px,
+            w, h, point_size,
         )
         rgb = rgb.to(ctx.targets.rgb.device)
         depth = depth.to(ctx.targets.depth.device)
@@ -159,6 +175,43 @@ class SplatPass(RenderPass):
 
 # Ambient floor for point-cloud Lambert shading.
 _SPLAT_AMBIENT = 0.25
+
+
+def auto_point_size_px(cloud, camera, height: int) -> float:  # type: ignore[no-untyped-def]
+    """Density-inferred disk size in the ``point_size_px`` parameterisation.
+
+    The world-space disk radius is half the mean inter-point spacing,
+    estimated from the cloud's bounding box (volume / count for 3-D
+    clouds, area / count for planar ones, length / count for lines). It
+    is converted to the existing ``point_size_px / eye_depth`` model via
+    the camera's pixel focal length, so the on-screen disk stays roughly
+    one spacing wide at any scene scale and view distance.
+    """
+    n = max(int(cloud.num_points), 1)
+    lo, hi = cloud.aabb()
+    dims = torch.sort((hi - lo).detach().to(torch.float64).clamp(min=0.0),
+                      descending=True).values
+    d0, d1, d2 = (float(dims[0]), float(dims[1]), float(dims[2]))
+    if d0 <= 0.0:
+        radius = 0.5                                   # single point
+    elif d1 <= 0.0:
+        radius = 0.5 * d0 / n                          # 1-D line cloud
+    elif d2 <= 0.0:
+        radius = 0.5 * math.sqrt(d0 * d1 / n)          # 2-D sheet cloud
+    else:
+        radius = 0.5 * (d0 * d1 * d2 / n) ** (1.0 / 3.0)
+    return max(2.0 * radius * _focal_px(camera, height), 1e-3)
+
+
+def _focal_px(camera, height: int) -> float:  # type: ignore[no-untyped-def]
+    """Vertical focal length in pixels (world-unit → px scale at 1 m)."""
+    fov = getattr(camera, "fov_deg", None)
+    if fov is not None:
+        return height / (2.0 * math.tan(math.radians(float(fov)) * 0.5))
+    half_h = getattr(camera, "half_height", None)
+    if half_h:                                         # OrthographicCamera
+        return height / (2.0 * float(half_h))
+    return height / (2.0 * math.tan(math.radians(45.0) * 0.5))
 
 
 def _shade_points(positions: torch.Tensor, colors: torch.Tensor,

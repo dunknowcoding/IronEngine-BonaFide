@@ -63,3 +63,6 @@ site/
 # Native build artifacts / stale quarantine
 native/_stale_build_quarantined/
 *.pyd
+
+# External 3D assets (downloaded models — never commit; see external_assets/SOURCES.md)
+external_assets/

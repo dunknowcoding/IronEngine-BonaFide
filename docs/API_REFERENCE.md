@@ -201,7 +201,7 @@ cfg.to_file(path)                → None
 class RenderOutputs:
     rgb:     _OutputTensor                       # (H, W, 3) linear HDR float32
     depth:   torch.Tensor | None = None          # (H, W) NDC z in [-1, 1], +inf where empty
-                                                 # (Sim shim converts to linear meters)
+                                                 # (unproject to linear meters for sensors)
     normals: torch.Tensor | None = None          # (H, W, 3) world-space
     ids:     torch.Tensor | None = None          # (H, W) int64 instance IDs
     albedo:  torch.Tensor | None = None          # (H, W, 3) GBuffer albedo
@@ -337,7 +337,7 @@ Constructors:
 |----------------------------------------------|---------------------------------------------|
 | `Mesh.from_arrays(positions, indices, ...)`  | From numpy / torch arrays                    |
 | `Mesh.from_obj(path)`                        | OBJ (positions / normals / uvs)              |
-| `Mesh.from_glb(path)`                        | GLB / glTF                                   |
+| `Mesh.from_glb(path)`                        | GLB / glTF — merged primitives, embedded baseColor textures decoded to `albedo_map` (see [Rendering Files](RENDERING_FILES.md)) |
 | `Mesh.from_reconstructed(recon)`             | From 3DCreator's `ReconstructedMesh`         |
 
 Builders: `.with_material(mat)`, `.with_colors(c)`.
@@ -404,9 +404,10 @@ Shading: `roughness` / `metallic` / `emissive` are honored by the PBR pass on
 both backends via Cook-Torrance GGX (Trowbridge-Reitz D, Smith Schlick-GGX G,
 Schlick F with `F0 = mix(0.04, albedo, metallic)`; roughness clamped to
 [0.045, 1], `alpha = roughness²`). `emissive` is added after lighting.
-`ior` is carried for round-trip parity with Sim; the dielectric F0 baseline is
-fixed at 0.04 (≈ ior 1.45). Map slots (`*_map`) are resolved by the asset
-mount but not yet sampled by the shader.
+`ior` is carried for round-trip parity with sibling engines; the dielectric F0
+baseline is fixed at 0.04 (≈ ior 1.45). Map slots (`*_map`) are filesystem
+paths (or asset-mount names) sampled by the PBR pass on the CPU path — see
+[Rendering Files](RENDERING_FILES.md) for texture-map recipes.
 
 ---
 
@@ -576,14 +577,6 @@ from ironengine_bonafide.integrations.creator3d import (
 )
 img_rgba = render_points_offscreen(positions, colors, options)   # (H, W, 4) uint8
 img_rgba = render_mesh_offscreen(positions, indices, normals, colors, options)
-```
-
-### IronEngine-Sim
-
-```python
-from ironengine_bonafide.integrations.sim import install, install_for_world, uninstall
-install()                                       # patch RenderWorld globally
-install_for_world(world)                        # variant that pins a specific World
 ```
 
 ---

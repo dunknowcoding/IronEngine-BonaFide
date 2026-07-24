@@ -1,7 +1,7 @@
 # IronEngine-BonaFide — User Guide
 
 > A complete walkthrough — installation, scenes, cameras, materials, the four
-> point-cloud R&D paths, and how to plug into 3DCreator and Sim. Every example
+> point-cloud R&D paths, and how to plug into 3DCreator. Every example
 > here is testable code.
 
 ---
@@ -19,11 +19,10 @@
 9. [Lighting](#9-lighting)
 10. [Differentiable Rendering](#10-differentiable-rendering)
 11. [3DCreator Integration](#11-3dcreator-integration)
-12. [IronEngine-Sim Integration](#12-ironengine-sim-integration)
-13. [Render Bundles](#13-render-bundles)
-14. [Profiling](#14-profiling)
-15. [CLI](#15-cli)
-16. [Troubleshooting](#16-troubleshooting)
+12. [Render Bundles](#12-render-bundles)
+13. [Profiling](#13-profiling)
+14. [CLI](#14-cli)
+15. [Troubleshooting](#15-troubleshooting)
 
 ---
 
@@ -143,7 +142,7 @@ OrthographicCamera(position=(0,5,0), look_at=(0,0,0), half_width=2, half_height=
 SensorCamera(pose=np.eye(4), fov_deg=60.0)
 ```
 
-Right-handed Y-up. Forward is `-Z` in eye space (matches Sim & 3DCreator).
+Right-handed Y-up. Forward is `-Z` in eye space (matches 3DCreator).
 
 ---
 
@@ -191,6 +190,11 @@ mesh = Mesh.from_glb("model.glb").with_material(PBRMaterial(
     two_sided=False,
 ))
 ```
+
+Texture maps are sampled on the **CPU reference path** (the CUDA raster path
+skips them and notes `pbr:texture_maps_cpu_path_only` in
+`out.skipped_passes`). For file-format coverage — PLY/PCD/OBJ/GLB recipes and
+embedded GLB textures — see [Rendering Files](RENDERING_FILES.md).
 
 CUDA path: `nvdiffrast` deferred shading with PBR + IBL. CPU path: barycentric
 raster into a GBuffer, then Cook-Torrance GGX shading. Differentiable in either
@@ -299,41 +303,7 @@ cloud = PointCloud.from_generation_result(creator_result)
 
 ---
 
-## 12. IronEngine-Sim Integration
-
-```python
-from ironengine_bonafide.integrations.sim import install
-install()                                      # patches RenderWorld
-```
-
-Or, when you've built the World programmatically:
-
-```python
-from ironengine_bonafide.integrations.sim import install_for_world
-install_for_world(world)
-```
-
-Patched methods:
-`RenderWorld.render_viewport`, `.render_sensor_rgb`, `.render_sensor_depth`.
-
-Bridging semantics:
-
-- **Transforms** — each entity's full TRS (`Transform.position`, xyzw
-  `rotation` quaternion, `scale`) is baked into a transformed copy of the mesh
-  / point-cloud geometry. Baked geometry is cached per `(asset, matrix)`, so
-  static scenes don't re-transform every frame.
-- **Point clouds** — Sim's `PointCloudAsset` component (`cloud_name`,
-  `point_size`, `default_color`) maps to a BonaFide `PointCloud` resolved via
-  `world.assets.get_point_cloud(name)`, with the same TRS bake applied.
-- **Lights** — directional and point lights map 1:1; Sim **spot** lights are
-  approximated as point lights (cone shaping is dropped).
-- **Sensor depth** — `render_sensor_depth` returns **linear eye-space
-  meters**, unprojected from the rasterizer's NDC z via the camera near/far
-  (`2·near·far / (far + near − z·(far − near))`). Empty pixels read as `far`.
-
----
-
-## 13. Render Bundles
+## 12. Render Bundles
 
 Reproducibility-friendly snapshots of (scene + camera + config + seed):
 
@@ -351,7 +321,7 @@ payload.
 
 ---
 
-## 14. Profiling
+## 13. Profiling
 
 ```python
 with engine.profile() as prof:
@@ -364,7 +334,7 @@ total. Skipped passes are listed in `out.skipped_passes`.
 
 ---
 
-## 15. CLI
+## 14. CLI
 
 ```bash
 bonafide info                                  # show backend probe
@@ -389,7 +359,7 @@ bonafide list-templates                        # bundled examples
 
 ---
 
-## 16. Troubleshooting
+## 15. Troubleshooting
 
 | Symptom                                                  | Likely cause / fix                                                                                  |
 |----------------------------------------------------------|------------------------------------------------------------------------------------------------------|
