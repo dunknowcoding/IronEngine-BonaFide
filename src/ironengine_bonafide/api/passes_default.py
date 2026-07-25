@@ -3,17 +3,18 @@
 Order:
 
   sky → shadow → softbody-step → lod → completion → splat → pbr →
-  particles → water → volumetric → neural_relight → AA → bloom →
-  neural_denoise → neural_upscale → tonemap
+  particles → water → volumetric → neural_relight → ssaa_downsample →
+  AA → god_rays → bloom → neural_denoise → neural_upscale → tonemap
 
 Each pass is gated on its own ``is_active(ctx)`` and ``required_capabilities()``;
 the engine skips passes whose checks fail and records the skip reason.
 """
 from __future__ import annotations
 
-from ironengine_bonafide.passes.aa_pass import SmaaPass, TaaPass
+from ironengine_bonafide.passes.aa_pass import SmaaPass, SsaaDownsamplePass, TaaPass
 from ironengine_bonafide.passes.base import RenderPass
 from ironengine_bonafide.passes.completion_pass import CompletionPass
+from ironengine_bonafide.passes.godrays_pass import GodRaysPass
 from ironengine_bonafide.passes.lod_pass import LodPass
 from ironengine_bonafide.passes.neural_denoise import NeuralDenoisePass
 from ironengine_bonafide.passes.neural_relight import NeuralRelightPass
@@ -43,9 +44,11 @@ def default_passes() -> list[RenderPass]:
         WaterPass(),
         VolumetricPass(),
         NeuralRelightPass(),
+        SsaaDownsamplePass(),
         FxaaPass(),
         TaaPass(),
         SmaaPass(),
+        GodRaysPass(),
         BloomPass(),
         NeuralDenoisePass(),
         NeuralUpscalePass(),

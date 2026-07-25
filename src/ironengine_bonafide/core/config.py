@@ -83,7 +83,25 @@ class RenderConfig:
     shadow_bias_constant: float = 0.2       # depth bias, constant term (texels)
     shadow_bias_slope: float = 1.0          # depth bias, slope-term multiplier (x clamped ground slope)
     shadow_bias_override: float | None = None   # explicit world-space bias; wins over constant+slope
+    # ---- anti-aliasing -------------------------------------------------
+    # ssaa = full-scene supersampling: geometry renders at ssaa× the output
+    # resolution and is area-averaged down before post passes. 1 = off.
+    ssaa: int = 1
+    # ---- bloom / glow --------------------------------------------------
     bloom: bool = True
+    bloom_threshold: float = 1.0            # HDR knee; only brighter pixels glow
+    bloom_intensity: float = 0.6            # additive strength of the halo
+    bloom_radius: int = 1                   # gaussian pyramid levels (1 = legacy 5-tap)
+    # ---- god rays (crepuscular rays from the sun) ----------------------
+    god_rays: bool = False
+    god_ray_intensity: float = 0.6
+    god_ray_samples: int = 24               # radial-blur taps per pixel
+    god_ray_decay: float = 0.95             # per-tap falloff away from the sun
+    # ---- transparency ---------------------------------------------------
+    # Alpha-blended rendering for materials with alpha < 1 (glass). Two-pass
+    # draw: opaque first (depth write), then transparent sorted back-to-front
+    # (depth test, no depth write). Off = legacy fully-opaque behavior.
+    transparency: bool = False
     exposure: float = 1.0
     # ---- point clouds --------------------------------------------------
     gsplat: GsplatConfig = field(default_factory=GsplatConfig)
@@ -146,6 +164,20 @@ class RenderConfig:
             )
         if self.aa not in ("off", "fxaa", "taa", "smaa"):
             raise ConfigurationError(f"aa='{self.aa}' must be off|fxaa|taa|smaa")
+        if self.ssaa not in (1, 2, 4):
+            raise ConfigurationError(f"ssaa must be 1/2/4 (got {self.ssaa})")
+        if self.bloom_threshold < 0.0:
+            raise ConfigurationError(f"bloom_threshold must be >= 0 (got {self.bloom_threshold})")
+        if self.bloom_intensity < 0.0:
+            raise ConfigurationError(f"bloom_intensity must be >= 0 (got {self.bloom_intensity})")
+        if self.bloom_radius not in (1, 2, 3, 4):
+            raise ConfigurationError(f"bloom_radius must be 1-4 (got {self.bloom_radius})")
+        if self.god_ray_intensity < 0.0:
+            raise ConfigurationError(f"god_ray_intensity must be >= 0 (got {self.god_ray_intensity})")
+        if not (1 <= self.god_ray_samples <= 128):
+            raise ConfigurationError(f"god_ray_samples must be 1-128 (got {self.god_ray_samples})")
+        if not (0.0 < self.god_ray_decay <= 1.0):
+            raise ConfigurationError(f"god_ray_decay must be in (0, 1] (got {self.god_ray_decay})")
         if self.shadows not in ("off", "csm", "vsm"):
             raise ConfigurationError(f"shadows='{self.shadows}' must be off|csm|vsm")
         if self.shadow_map_resolution <= 0:

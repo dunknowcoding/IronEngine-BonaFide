@@ -53,6 +53,7 @@ class SkyPass(RenderPass):
 
         dirs = ray_directions(ctx.camera, ctx.aspect, w, h, device)
 
+        sky: torch.Tensor | None = None
         if bg.mode == "envmap" and ctx.scene.ibl is not None:
             try:
                 from ironengine_bonafide.core.light import IBL
@@ -60,22 +61,83 @@ class SkyPass(RenderPass):
                 env = torch.as_tensor(ibl.load(), dtype=torch.float32, device=device)
                 if env.ndim == 3 and env.shape[-1] >= 3:
                     sky = equirect_sample(env[..., :3].contiguous(), dirs)
-                    ctx.targets.rgb[empty] = (sky * ibl.intensity * bg.intensity)[empty]
-                    return
+                    sky = sky * ibl.intensity * bg.intensity
             except Exception:                                   # noqa: BLE001
                 ctx.skipped.append("sky:envmap_load_failed→gradient")
+                sky = None
 
-        # Gradient (default + fallback).
-        elev = dirs[..., 1]                                     # sin(elevation)
-        t_up = (elev / math.sin(_ZENITH_SPAN)).clamp(0.0, 1.0).unsqueeze(-1)
-        t_dn = (-elev / math.sin(_GROUND_SPAN)).clamp(0.0, 1.0).unsqueeze(-1)
-        zenith = torch.tensor(bg.zenith_color, dtype=torch.float32, device=device)
-        horizon = torch.tensor(bg.horizon_color, dtype=torch.float32, device=device)
-        ground = torch.tensor(bg.ground_color, dtype=torch.float32, device=device)
-        above = horizon * (1.0 - t_up) + zenith * t_up
-        below = horizon * (1.0 - t_dn) + ground * t_dn
-        sky = torch.where((elev >= 0.0).unsqueeze(-1), above, below) * bg.intensity
+        if sky is None:
+            # Gradient (default + fallback).
+            elev = dirs[..., 1]                                 # sin(elevation)
+            t_up = (elev / math.sin(_ZENITH_SPAN)).clamp(0.0, 1.0).unsqueeze(-1)
+            t_dn = (-elev / math.sin(_GROUND_SPAN)).clamp(0.0, 1.0).unsqueeze(-1)
+            zenith = torch.tensor(bg.zenith_color, dtype=torch.float32, device=device)
+            horizon = torch.tensor(bg.horizon_color, dtype=torch.float32, device=device)
+            ground = torch.tensor(bg.ground_color, dtype=torch.float32, device=device)
+            above = horizon * (1.0 - t_up) + zenith * t_up
+            below = horizon * (1.0 - t_dn) + ground * t_dn
+            sky = torch.where((elev >= 0.0).unsqueeze(-1), above, below) * bg.intensity
+
+        sky = _add_celestial_discs(ctx, bg, sky, dirs)
         ctx.targets.rgb[empty] = sky[empty]
+
+
+def _sun_direction(ctx: PassContext) -> torch.Tensor | None:
+    """Unit vector toward the sun = negated direction of the first
+    DirectionalLight, or None when the scene has none."""
+    from ironengine_bonafide.core.light import DirectionalLight
+    for lt in ctx.scene.lights:
+        if isinstance(lt, DirectionalLight):
+            d = torch.tensor(lt.direction, dtype=torch.float32,
+                             device=ctx.targets.rgb.device)
+            n = torch.linalg.norm(d)
+            if float(n) < 1e-9:
+                return None
+            return -d / n
+    return None
+
+
+def _angular_disc(dirs: torch.Tensor, toward: torch.Tensor,
+                  radius_deg: float) -> torch.Tensor:
+    """Smooth-edged angular disc mask ∈ [0, 1], (H, W).
+
+    1.0 inside ~80% of the angular radius, smoothstepping to 0 at the edge.
+    """
+    cos_r = math.cos(math.radians(radius_deg))
+    cos_inner = math.cos(math.radians(radius_deg * 0.8))
+    cosang = (dirs * toward).sum(dim=-1)
+    t = ((cosang - cos_r) / max(1e-9, cos_inner - cos_r)).clamp(0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _add_celestial_discs(ctx: PassContext, bg, sky: torch.Tensor,  # type: ignore[no-untyped-def]
+                         dirs: torch.Tensor) -> torch.Tensor:
+    """Sun/moon discs (+ cheap sun-side horizon glow), opt-in via Background."""
+    device = sky.device
+    if getattr(bg, "sun_disc", False):
+        sun_dir = _sun_direction(ctx)
+        if sun_dir is None:
+            ctx.skipped.append("sky:sun_disc_no_directional_light")
+        else:
+            sun_col = torch.tensor((1.0, 0.97, 0.90), dtype=torch.float32, device=device)
+            disc = _angular_disc(dirs, sun_dir, float(bg.sun_disc_radius_deg))
+            sky = sky + sun_col * (float(bg.sun_disc_intensity) * disc).unsqueeze(-1)
+            glow = float(getattr(bg, "sun_horizon_glow", 0.0))
+            if glow > 0.0:
+                # Warm forward-scatter band hugging the horizon on the sun
+                # side: strong looking toward the sun, tight around elev ≈ 0.
+                elev = dirs[..., 1]
+                horiz = (1.0 - (elev / math.sin(0.35)).abs()).clamp(0.0, 1.0)
+                forward = ((dirs * sun_dir).sum(dim=-1).clamp(min=0.0)) ** 4
+                warm = torch.tensor((1.0, 0.62, 0.38), dtype=torch.float32, device=device)
+                sky = sky + warm * (glow * horiz * forward).unsqueeze(-1)
+    if getattr(bg, "moon_disc", False):
+        md = torch.tensor(bg.moon_direction, dtype=torch.float32, device=device)
+        md = md / torch.linalg.norm(md).clamp(min=1e-9)
+        disc = _angular_disc(dirs, md, float(bg.moon_disc_radius_deg))
+        mc = torch.tensor(bg.moon_color, dtype=torch.float32, device=device)
+        sky = sky + mc * (float(bg.moon_disc_intensity) * disc).unsqueeze(-1)
+    return sky
 
 
 def ray_directions(

@@ -65,11 +65,37 @@ class PbrPass(RenderPass):
         return bool(ctx.scene.meshes)
 
     def run(self, ctx: PassContext) -> None:
-        for mesh_id, mesh in enumerate(ctx.scene.meshes, start=1):
+        if not bool(getattr(ctx.config, "transparency", False)):
+            for mesh_id, mesh in enumerate(ctx.scene.meshes, start=1):
+                self._render_one(ctx, mesh, mesh_id)
+            return
+        # Two-pass draw: opaque meshes first (depth write), then transparent
+        # ones (alpha < 1) sorted back-to-front, depth-tested against the
+        # opaque depth buffer but without writing depth. Instance IDs keep
+        # their scene order so sensor outputs stay stable.
+        indexed = list(enumerate(ctx.scene.meshes, start=1))
+        opaque = [(i, m) for i, m in indexed if _mesh_alpha(m) >= _OPAQUE_EPS]
+        glass = [(i, m) for i, m in indexed if _mesh_alpha(m) < _OPAQUE_EPS]
+        for mesh_id, mesh in opaque:
             self._render_one(ctx, mesh, mesh_id)
+        if glass:
+            cam_pos = _camera_position(ctx.camera, ctx.targets.rgb.device,
+                                       ctx.targets.rgb.dtype)
+            fwd = torch.tensor(ctx.camera.view_matrix()[2, :3],
+                               device=cam_pos.device, dtype=cam_pos.dtype)
+
+            def _depth_key(item: tuple[int, object]) -> float:
+                mesh = item[1]
+                c = mesh.positions.mean(dim=0).to(cam_pos.device, cam_pos.dtype)
+                return float(-((c - cam_pos) * fwd).sum())  # view-space z
+
+            # Back-to-front (farthest first).
+            for mesh_id, mesh in sorted(glass, key=_depth_key, reverse=True):
+                self._render_one(ctx, mesh, mesh_id, blend_alpha=_mesh_alpha(mesh))
 
     # --------------------------------------------------------- per-mesh
-    def _render_one(self, ctx: PassContext, mesh, instance_id: int) -> None:    # type: ignore[no-untyped-def]
+    def _render_one(self, ctx: PassContext, mesh, instance_id: int,    # type: ignore[no-untyped-def]
+                    blend_alpha: float | None = None) -> None:
         h, w, _ = ctx.targets.rgb.shape
         device = ctx.backend.device
         view_proj = ctx.camera.view_proj_torch(ctx.aspect, device=device)
@@ -162,7 +188,10 @@ class PbrPass(RenderPass):
             rough=rough_t, metal=metal_t, ao=ao_t,
             view_depth=view_depth,
         )
-        self._composite(ctx, shaded, depth, nrm, instance_id, mask, colors_albedo=albedo)
+        if blend_alpha is not None:
+            self._composite_blend(ctx, shaded, depth, mask, blend_alpha)
+        else:
+            self._composite(ctx, shaded, depth, nrm, instance_id, mask, colors_albedo=albedo)
 
     # --------------------------------------------------------- composite
     def _composite(self, ctx, shaded, depth, nrm, instance_id, mask, *, colors_albedo):  # type: ignore[no-untyped-def]
@@ -175,6 +204,18 @@ class PbrPass(RenderPass):
         ctx.targets.albedo[better] = colors_albedo[better]
         ctx.targets.ids[better] = int(instance_id)
 
+    def _composite_blend(self, ctx, shaded, depth, mask, alpha: float) -> None:  # type: ignore[no-untyped-def]
+        """Alpha-blend a transparent mesh: depth-test against the opaque
+        depth buffer, blend over the current colour, and write NOTHING else
+        (no depth / normals / ids / albedo — transparent surfaces don't
+        occlude and must not poison sensor outputs)."""
+        better = (depth < ctx.targets.depth) & (mask > 0.5)
+        if not torch.any(better):
+            return
+        a = min(1.0, max(0.0, float(alpha)))
+        ctx.targets.rgb[better] = (ctx.targets.rgb[better] * (1.0 - a)
+                                   + shaded[better] * a)
+
 
 # --------------------------------------------------------------- shading
 # Hemisphere ambient: sky above, bounce tint below (fallback when no IBL).
@@ -183,6 +224,13 @@ _GROUND_COLOR = (0.35, 0.33, 0.30)
 _AMBIENT_INTENSITY = 0.25
 # Dielectric Fresnel baseline (ior ≈ 1.45 → ((ior-1)/(ior+1))² ≈ 0.04).
 _F0_DIELECTRIC = 0.04
+# Material alpha at/above this renders via the legacy opaque path.
+_OPAQUE_EPS = 0.999
+
+
+def _mesh_alpha(mesh) -> float:                              # type: ignore[no-untyped-def]
+    """Scalar opacity of a mesh's material (1.0 when unset)."""
+    return float(getattr(getattr(mesh, "material", None), "alpha", 1.0))
 
 
 def _camera_position(camera, device, dtype) -> torch.Tensor:              # type: ignore[no-untyped-def]

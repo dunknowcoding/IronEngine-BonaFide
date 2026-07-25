@@ -19,6 +19,10 @@ class PBRMaterial:
     metallic: float = 0.0
     ior: float = 1.45
     emissive: Vec3 = (0.0, 0.0, 0.0)
+    # Opacity (glTF baseColorFactor alpha). 1.0 = opaque (default, legacy
+    # behavior). Values < 1 render alpha-blended when
+    # ``RenderConfig.transparency`` is enabled.
+    alpha: float = 1.0
     # Map slots — names resolved via the asset mount.
     albedo_map: str | None = None
     metallic_roughness_map: str | None = None
@@ -39,6 +43,7 @@ class PBRMaterial:
             "metallic": self.metallic,
             "ior": self.ior,
             "emissive": list(self.emissive),
+            "alpha": self.alpha,
             "albedo_map": self.albedo_map,
             "metallic_roughness_map": self.metallic_roughness_map,
             "normal_map": self.normal_map,
@@ -59,6 +64,7 @@ class PBRMaterial:
             metallic=float(d.get("metallic", 0.0)),
             ior=float(d.get("ior", 1.45)),
             emissive=tuple(d.get("emissive", (0.0, 0.0, 0.0))),  # type: ignore[arg-type]
+            alpha=float(d.get("alpha", 1.0)),
             albedo_map=d.get("albedo_map"),
             metallic_roughness_map=d.get("metallic_roughness_map"),
             normal_map=d.get("normal_map"),

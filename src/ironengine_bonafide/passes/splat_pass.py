@@ -68,6 +68,11 @@ class SplatPass(RenderPass):
             else _default_color(positions)
         )
         normals = cloud.normals
+        opacities = (
+            cloud.opacities.to(ctx.backend.device)
+            if getattr(cloud, "opacities", None) is not None
+            else None
+        )
         # Apply the LOD subset the LodPass recorded for this frame (the
         # cloud itself is never mutated).
         from ironengine_bonafide.passes.lod_pass import lod_indices_for
@@ -77,9 +82,17 @@ class SplatPass(RenderPass):
             positions = positions[lod_idx]
             colors = colors[lod_idx]
             normals = normals[lod_idx] if normals is not None else None
+            opacities = opacities[lod_idx] if opacities is not None else None
         # Pre-shade vertex colors (Lambert N·L + ambient) when the cloud
         # carries normals; without normals the raw colors pass through.
         colors = _shade_points(positions, colors, normals, ctx.scene.lights)
+
+        # Per-point alpha blending (opt-in via RenderConfig.transparency).
+        blend = (
+            bool(getattr(ctx.config, "transparency", False))
+            and opacities is not None
+            and float(opacities.min()) < 1.0
+        )
 
         if use_gsplat:
             self._render_gsplat(ctx, positions, colors, cloud)
@@ -91,12 +104,28 @@ class SplatPass(RenderPass):
         point_size = cloud.point_size_px
         if getattr(cloud, "auto_point_size", False):
             point_size = auto_point_size_px(cloud, ctx.camera, h)
-        if use_native:
+        if use_native and not blend:
             self._render_native_splat(ctx, positions, colors, view_proj, w, h, point_size)
             return
 
         # CPU torch disk-splat fallback.
         be = ctx.backend if isinstance(ctx.backend, CpuBackend) else CpuBackend()
+        if blend:
+            from ironengine_bonafide.backends import torch_raster
+            rgb, depth, alpha = torch_raster.raster_points_rgba(
+                positions.cpu(), colors.cpu(), opacities.cpu(), view_proj.cpu(),
+                w, h, point_size,
+            )
+            rgb = rgb.to(ctx.targets.rgb.device)
+            depth = depth.to(ctx.targets.depth.device)
+            alpha = alpha.to(ctx.targets.rgb.device)
+            better = (depth < ctx.targets.depth) & (alpha > 0.0)
+            if torch.any(better):
+                a = alpha[better].clamp(0.0, 1.0).unsqueeze(-1)
+                # Alpha blend; no depth write (transparent splats don't occlude).
+                ctx.targets.rgb[better] = (ctx.targets.rgb[better] * (1.0 - a)
+                                           + rgb[better] * a)
+            return
         rgb, depth = self._raster_points(
             be, positions.cpu(), colors.cpu(), view_proj.cpu(),
             w, h, point_size,

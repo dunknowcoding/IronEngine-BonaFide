@@ -17,6 +17,7 @@
 7. [Meshes & Materials](#7-meshes--materials)
 8. [Volumes, Particles, Soft Bodies](#8-volumes-particles-soft-bodies)
 9. [Lighting](#9-lighting)
+9A. [Visual Quality — AA, Bloom, God Rays, Glass, Sky Discs](#9a-visual-quality--aa-bloom-god-rays-glass-sky-discs)
 10. [Differentiable Rendering](#10-differentiable-rendering)
 11. [3DCreator Integration](#11-3dcreator-integration)
 12. [Render Bundles](#12-render-bundles)
@@ -246,6 +247,79 @@ SpotLight(position=(0,2,0), direction=(0,-1,0), inner_deg=20, outer_deg=30)
 AreaLight(position=(0,2,0), normal=(0,-1,0), extent=(1,1), intensity=4)
 IBL.from_hdr("studio_4k.hdr", intensity=1.2)
 ```
+
+---
+
+## 9A. Visual Quality — AA, Bloom, God Rays, Glass, Sky Discs
+
+All of these are **opt-in config fields** (or default-off `Background` flags);
+with every default untouched the renderer is bit-identical to before.
+
+### Anti-aliasing
+
+```python
+RenderConfig(ssaa=4)          # render 4× larger, area-average down (linear HDR)
+RenderConfig(aa="fxaa")       # default: luma-edge post blend after resolve
+```
+
+- `ssaa` (1/2/4) is full-scene supersampling: geometry passes render at
+  `ssaa×` resolution and the frame is area-averaged down **before** FXAA /
+  bloom / tonemap (correct linear-space resolve). Depth is min-pooled, IDs
+  use block-centre nearest.
+- `aa="fxaa"` blends each pixel toward its 3×3 average with a weight ∝ the
+  local luma contrast (capped 0.5); flat regions pass through bit-exact.
+
+### Bloom / glow
+
+```python
+RenderConfig(bloom=True, bloom_threshold=1.0, bloom_intensity=0.9, bloom_radius=3)
+```
+
+Pixels brighter than `bloom_threshold` (HDR knee) feed a progressive
+separable-gaussian pyramid; `bloom_radius` (1–4) widens the halo,
+`bloom_intensity` scales it. `bloom_radius=1` + defaults is the legacy
+single-pass bloom, bit-for-bit.
+
+### God rays
+
+```python
+RenderConfig(god_rays=True, god_ray_intensity=0.6, god_ray_samples=24,
+             god_ray_decay=0.95)
+```
+
+Screen-space radial blur of the thresholded bright buffer, centred on the
+projected sun (first `DirectionalLight`). Self-skips when the sun is behind
+the camera or too far off-screen. Runs before bloom so the rays glow.
+
+### Transparency (glass)
+
+```python
+RenderConfig(transparency=True)
+PBRMaterial(albedo=(0.9, 0.95, 1.0), roughness=0.05, alpha=0.4)   # glass pane
+cloud.opacities = torch.full((n,), 0.5)                            # soft splats
+```
+
+Two-pass draw: opaque meshes first (depth write), then `alpha < 1` meshes
+sorted back-to-front — depth-tested against the opaque buffer, blended, and
+**no depth / normals / ids writes** (glass never occludes). GLB
+`baseColorFactor` alpha lands on `PBRMaterial.alpha`; point-cloud
+`opacities` are honored on the CPU splat path. With `transparency=False`
+alpha is ignored (legacy fully-opaque behavior).
+
+### Sun / moon sky discs
+
+```python
+Background(sun_disc=True, sun_disc_intensity=40, sun_disc_radius_deg=1.0,
+           sun_horizon_glow=0.3,
+           moon_disc=True, moon_direction=(0.45, 0.35, -0.82),
+           moon_disc_intensity=8)
+```
+
+The sun disc tracks the first `DirectionalLight`; the moon disc uses an
+explicit direction. Both are HDR emitters painted by the sky pass
+(gradient/envmap modes), so the default bloom pass halos them.
+`sun_horizon_glow` adds a cheap warm forward-scatter band around the
+horizon on the sun side.
 
 ---
 

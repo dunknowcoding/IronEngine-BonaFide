@@ -48,8 +48,8 @@ The default pass list in `_default_passes()` is:
 
 ```
 shadow → softbody → completion → splat → pbr → particles → water →
-volumetric → neural_relight → AA → bloom → neural_denoise →
-neural_upscale → tonemap
+volumetric → neural_relight → ssaa_downsample → AA → god_rays → bloom →
+neural_denoise → neural_upscale → tonemap
 ```
 
 A pass is **skipped** in three cases (and recorded in `out.skipped_passes`):

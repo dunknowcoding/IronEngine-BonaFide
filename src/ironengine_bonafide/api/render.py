@@ -72,7 +72,10 @@ def _do_render(
         raise BonaFideError("Engine has been closed; construct a new one")
     seed_everything(config.seed)
     backend = engine.backend
-    h, w = config.height, config.width
+    # Full-scene supersampling: geometry passes work on an ssaa× frame;
+    # SsaaDownsamplePass resolves it to the requested size before post.
+    ssaa = int(getattr(config, "ssaa", 1))
+    h, w = config.height * ssaa, config.width * ssaa
     device = backend.device
 
     targets = FrameTargets(

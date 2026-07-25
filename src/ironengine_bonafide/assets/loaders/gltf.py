@@ -13,8 +13,9 @@ Correctness notes (vs. the previous version):
   (:func:`load_mesh` still merges for legacy callers; its docstring says the
   first primitive's material wins).
 * **baseColor alpha and emissiveFactor are kept** — alpha rides on
-  :class:`GltfPrimitive` because ``PBRMaterial`` has no opacity channel yet;
-  emissiveFactor maps to ``PBRMaterial.emissive``.
+  ``PBRMaterial.alpha`` (honored by the PBR pass when
+  ``RenderConfig.transparency`` is on) and on :class:`GltfPrimitive` for
+  legacy callers; emissiveFactor maps to ``PBRMaterial.emissive``.
 * ``COLOR_0`` vertex colors are loaded when present.
 
 Embedded **base-color textures are resolved**: PNG/JPEG images carried in the
@@ -279,6 +280,7 @@ def _material_for(
             name=m.name or "default",
             albedo=albedo, roughness=roughness, metallic=metallic,
             emissive=emissive, albedo_map=albedo_map, two_sided=bool(m.doubleSided),
+            alpha=alpha,
         ),
         alpha,
         bool(m.doubleSided),

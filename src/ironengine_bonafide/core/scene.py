@@ -51,6 +51,22 @@ class Background:
     horizon_color: tuple[float, float, float] = (0.72, 0.76, 0.80)
     ground_color: tuple[float, float, float] = (0.32, 0.30, 0.28)
     intensity: float = 1.0
+    # ---- sun disc (gradient/envmap modes) ------------------------------
+    # When enabled, the SkyPass renders an HDR disc at the first
+    # DirectionalLight's direction; at default bloom settings the disc
+    # exceeds the bloom threshold and therefore glows.
+    sun_disc: bool = False
+    sun_disc_intensity: float = 40.0        # HDR radiance multiplier (× light color)
+    sun_disc_radius_deg: float = 1.0        # visual angular radius (real sun ≈ 0.265°)
+    # Cheap atmospheric forward-scatter: warm tint hugging the horizon on
+    # the sun side. 0 disables; only evaluated when ``sun_disc`` is on.
+    sun_horizon_glow: float = 0.3
+    # ---- moon disc (gradient/envmap modes) ------------------------------
+    moon_disc: bool = False
+    moon_direction: tuple[float, float, float] = (0.45, 0.35, -0.82)
+    moon_color: tuple[float, float, float] = (0.82, 0.86, 0.95)
+    moon_disc_intensity: float = 8.0
+    moon_disc_radius_deg: float = 0.9
 
 
 @dataclass(slots=True)

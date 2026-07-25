@@ -129,7 +129,6 @@ class RenderConfig:
     width:  int = 1280
     height: int = 720
     samples: int = 1
-    aa: "off"|"fxaa"|"taa"|"smaa" = "fxaa"
     output_dtype:        "uint8"|"float16"|"float32" = "float32"
     output_color_space:  "linear"|"sRGB" = "linear"
     sensor_outputs:      tuple[str, ...] = ("rgb",)   # any of "rgb","depth","normals","ids","albedo"
@@ -137,7 +136,25 @@ class RenderConfig:
     vram_budget_mb:      float = 4096.0
     seed: int = 0
     shadows: "off"|"csm"|"vsm" = "csm"
+    # --- anti-aliasing ---
+    aa: "off"|"fxaa"|"taa"|"smaa" = "fxaa"
+    ssaa: int = 1                     # full-scene supersample factor 1/2/4;
+                                      # renders at ssaa× and area-averages down
+                                      # (linear HDR) before post passes
+    # --- bloom / glow ---
     bloom:   bool = True
+    bloom_threshold: float = 1.0      # HDR knee; only brighter pixels glow
+    bloom_intensity: float = 0.6      # halo strength
+    bloom_radius:    int = 1          # gaussian-pyramid levels 1-4 (1 = legacy)
+    # --- god rays (opt-in) ---
+    god_rays:         bool = False    # screen-space radial blur from the sun
+    god_ray_intensity: float = 0.6
+    god_ray_samples:  int = 24        # radial taps per pixel (1-128)
+    god_ray_decay:    float = 0.95    # per-tap falloff in (0, 1]
+    # --- transparency (opt-in) ---
+    transparency: bool = False        # two-pass alpha blending for
+                                      # PBRMaterial.alpha < 1 and point-cloud
+                                      # opacities; depth test, no depth write
     exposure: float = 1.0
     gsplat:     GsplatConfig
     surfels:    SurfelConfig
@@ -385,6 +402,9 @@ class PBRMaterial:
     metallic:    float = 0.0
     ior:         float = 1.45
     emissive:    tuple[float×3] = (0, 0, 0)
+    alpha:       float = 1.0          # opacity (glTF baseColorFactor alpha);
+                                      # < 1 renders alpha-blended when
+                                      # RenderConfig.transparency is on
     albedo_map:                str | None = None
     metallic_roughness_map:    str | None = None
     normal_map:                str | None = None

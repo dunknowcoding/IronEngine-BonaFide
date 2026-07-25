@@ -602,6 +602,94 @@ def raster_points(
     return rgb, depth
 
 
+def raster_points_rgba(
+    positions: torch.Tensor,            # (N, 3)
+    colors: torch.Tensor,               # (N, 3)
+    opacities: torch.Tensor,            # (N,) per-point alpha in [0, 1]
+    view_proj: torch.Tensor,            # (4, 4)
+    width: int,
+    height: int,
+    point_size_px: float = 2.0,
+    background: tuple[float, float, float] = (0.05, 0.06, 0.10),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Alpha-carrying variant of :func:`raster_points`.
+
+    Identical projection / disk kernel / deterministic depth resolve; the
+    winning splat's opacity lands in an (H, W) alpha map (0 where no splat
+    hits) so callers can alpha-blend the colour over an existing frame.
+    Colours are NOT premultiplied.
+    """
+    device = positions.device
+    positions = positions.to(torch.float32)
+    colors = colors.to(torch.float32)
+    opacities = opacities.to(torch.float32).reshape(-1)
+    n = positions.shape[0]
+    bg = torch.tensor(background, dtype=torch.float32, device=device)
+    rgb = bg.expand(height, width, 3).contiguous()
+    depth = torch.full((height, width), float("inf"), dtype=torch.float32, device=device)
+    alpha = torch.zeros((height, width), dtype=torch.float32, device=device)
+    if n == 0:
+        return rgb, depth, alpha
+
+    sx, sy, sz, w = _project(positions, view_proj.to(torch.float32), width, height)
+    px = sx.round().long()
+    py = sy.round().long()
+    valid = ((px >= 0) & (px < width) & (py >= 0) & (py < height) & (w > _NEAR_EPS))
+    if not torch.any(valid):
+        return rgb, depth, alpha
+    px, py, c = px[valid], py[valid], colors[valid]
+    a = opacities[valid]
+    z = sz[valid].to(depth.dtype)                       # float64 proj → buffer dtype
+    eye_d = w[valid]
+
+    size = (float(point_size_px) / eye_d.clamp(min=1e-3)).clamp(1.0, 32.0)
+    radii = (size * 0.5).ceil().long()
+    r_max = int(radii.max().item())
+    if r_max <= 0:
+        offsets = torch.tensor([[0, 0]], dtype=torch.long, device=device)
+    else:
+        yy, xx = torch.meshgrid(
+            torch.arange(-r_max, r_max + 1, dtype=torch.long, device=device),
+            torch.arange(-r_max, r_max + 1, dtype=torch.long, device=device),
+            indexing="ij",
+        )
+        kmask = (yy * yy + xx * xx) <= r_max * r_max
+        offsets = torch.stack([yy[kmask], xx[kmask]], dim=1)      # (K, 2)
+
+    kx = offsets[:, 1]
+    ky = offsets[:, 0]
+    all_x = (px.unsqueeze(1) + kx.unsqueeze(0)).clamp_(0, width - 1)
+    all_y = (py.unsqueeze(1) + ky.unsqueeze(0)).clamp_(0, height - 1)
+    k_in = (kx * kx + ky * ky).unsqueeze(0) <= (radii * radii).unsqueeze(1)
+    flat = (all_y * width + all_x).reshape(-1)
+    all_z = z.unsqueeze(1).expand_as(all_x).reshape(-1)
+    all_c = c.unsqueeze(1).expand(c.shape[0], all_x.shape[1], 3).reshape(-1, 3)
+    all_a = a.unsqueeze(1).expand_as(all_x).reshape(-1)
+    k_in = k_in.reshape(-1)
+
+    dflat = depth.reshape(-1)
+    keep = k_in & (all_z < dflat[flat])
+    if not torch.any(keep):
+        return rgb, depth, alpha
+    flat = flat[keep]; all_z = all_z[keep]; all_c = all_c[keep]; all_a = all_a[keep]
+
+    dflat.scatter_reduce_(0, flat, all_z, reduce="amin", include_self=True)
+    zb = dflat[flat]
+    win = (all_z <= zb).nonzero(as_tuple=False).squeeze(1)
+    if win.numel() == 0:
+        return rgb, depth, alpha
+    pix = flat[win]
+    pix_u, inv = torch.unique(pix, return_inverse=True)
+    first = torch.full((pix_u.numel(),), win.numel(), dtype=torch.long, device=device)
+    cand = torch.arange(win.numel(), dtype=torch.long, device=device)
+    first.scatter_reduce_(0, inv, cand, reduce="amin", include_self=True)
+    final = win[cand == first[inv]]
+
+    rgb.reshape(-1, 3).index_copy_(0, flat[final], all_c[final])
+    alpha.reshape(-1).index_copy_(0, flat[final], all_a[final])
+    return rgb, depth, alpha
+
+
 # ------------------------------------------------------------------ helpers
 def vertex_normals(positions: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Area-weighted per-vertex normals from face geometry."""
