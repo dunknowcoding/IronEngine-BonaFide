@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+(nothing yet)
+
+## [0.2.0] — 2026-10-08
+
+First tagged release. The renderer is feature-complete at the reference
+tier: every subsystem below is implemented and covered by the test suite
+(210 passed, 1 skipped).
+
 ### Added
 - **VSM shadow mode** (`shadows="vsm"`): variance shadow maps — blurred
   (E[z], E[z²]) moments per cascade + Chebyshev visibility with
@@ -169,6 +177,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   NDC depth through mislabeled as meters; depth labels in
   `RenderOutputs` / `FrameTargets` / docs corrected to NDC z in [-1, 1].
 
-## [0.1.0] — TBD
+## [0.1.0] — unreleased
 
-Initial alpha. See `docs/USER_GUIDE.md` for capabilities matrix.
+Initial alpha (never tagged; superseded by 0.2.0). See `docs/USER_GUIDE.md`
+for the capabilities matrix.
