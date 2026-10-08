@@ -123,9 +123,9 @@ def light_from_dict(d: dict[str, Any]) -> Light:
         "ibl":         IBL,
     }
     cls = cls_map[kind]
-    # Restore tuple fields.
+    # Restore tuple fields (every list in the dict is a Vec3 / extent pair).
     for k, v in list(d.items()):
-        if isinstance(v, list) and k != "extent" or isinstance(v, list) and k == "extent":
+        if isinstance(v, list):
             d[k] = tuple(v)
     if "path" in d and d["path"] is not None:
         d["path"] = Path(d["path"])

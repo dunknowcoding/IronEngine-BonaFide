@@ -2,7 +2,7 @@
 
 >>> from ironengine_bonafide.api import (
 ...     Engine, Scene, PerspectiveCamera, OrthographicCamera, SensorCamera,
-...     PointCloud, Mesh, PBRMaterial, Volume, DollRig,
+...     PointCloud, Mesh, PBRMaterial, Volume, DollRig, WaterSurface, ParticleSystem,
 ...     DirectionalLight, PointLight, SpotLight, AreaLight, IBL,
 ...     RenderConfig, RenderOutputs, render, render_differentiable,
 ...     mount_assets,
@@ -59,10 +59,12 @@ from ironengine_bonafide.core.light import (
 )
 from ironengine_bonafide.core.material import PBRMaterial
 from ironengine_bonafide.core.mesh import Mesh
+from ironengine_bonafide.core.particles import ParticleSystem
 from ironengine_bonafide.core.pointcloud import PointCloud
 from ironengine_bonafide.core.scene import Background, Scene
 from ironengine_bonafide.core.softbody import DollRig
 from ironengine_bonafide.core.volume import Volume
+from ironengine_bonafide.core.water import WaterSurface
 
 # ---- Pass framework ------------------------------------------------------
 from ironengine_bonafide.passes.aa_pass import SmaaPass, TaaPass
@@ -94,7 +96,8 @@ __all__ = [
     # cameras
     "Camera", "OrthographicCamera", "PerspectiveCamera", "SensorCamera",
     # data model
-    "Background", "DollRig", "IBL", "Mesh", "PBRMaterial", "PointCloud", "Scene", "Volume",
+    "Background", "DollRig", "IBL", "Mesh", "PBRMaterial", "ParticleSystem",
+    "PointCloud", "Scene", "Volume", "WaterSurface",
     # lights
     "AreaLight", "DirectionalLight", "PointLight", "SpotLight",
     # config

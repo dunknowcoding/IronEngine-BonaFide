@@ -21,7 +21,6 @@ Thanks for your interest. This document captures the conventions so PRs can ship
 ## Setting up
 
 ```bash
-conda activate IronEngineWorld
 git clone https://github.com/<you>/IronEngine-BonaFide.git
 cd IronEngine-BonaFide
 pip install -e .[all,dev]

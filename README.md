@@ -150,30 +150,37 @@ install()
 ## 📦 Feature Matrix
 
 Honest status — ✅ means implemented and covered by the test suite
-(119 passed, 10 skipped as of this release); 🚧 means real code exists but
+(210 passed, 1 skipped as of this release); 🚧 means real code exists but
 the path is not production-ready.
 
 | Subsystem | Status | Notes |
 |---|---|---|
-| **Sky pass** | ✅ | Solid, gradient, and `envmap` equirect backgrounds |
+| **Sky pass** | ✅ | Solid, gradient, and `envmap` equirect backgrounds; sun/moon discs |
 | **Image-based lighting** | ✅ | Equirect diffuse irradiance + roughness-mip specular from HDR/EXR or in-memory pixels |
-| **CSM shadows** | ✅ | Cascaded shadow maps on **all** backends, including CPU |
-| **CPU rasterizer** | ✅ | Perspective-correct, deterministic (seeded, bit-exact within the backend) |
+| **Shadows** | ✅ | **CSM** (cascaded, texel-snapped, slope-scaled bias) and **VSM** (variance shadow maps, Chebyshev soft penumbra) on all backends |
+| **Lights** | ✅ | Directional (CSM/VSM shadows) · point · spot (cone) · **area** (3×3 stratified quadrature, one-sided) · IBL |
+| **CPU rasterizer** | ✅ | Perspective-correct, near-plane split, deterministic (seeded, bit-exact within the backend); line-segment raster too |
 | **PBR shading** | ✅ | Cook-Torrance GGX specular; `roughness` / `metallic` / `emissive` honored |
-| **Texture maps** | ✅ | Albedo / normal / metallic-roughness / AO map sampling in `PbrPass` — maps are supplied through the API |
+| **Texture maps** | ✅ | Albedo / normal / metallic-roughness / AO / **emissive** map sampling in `PbrPass` — maps are supplied through the API |
 | **Tonemap** | ✅ | Single, consistent ACES filmic → sRGB pipeline |
 | **GLB / glTF loader** | ✅ | Node transforms, `byteStride` interleaved buffers, multi-buffer, normalized `COLOR_0` |
 | **`.iemodel.json` loader** | ✅ | 3DCreator manifest sidecar, schema versions `iemodel/1` and `iemodel/2` |
 | **Asset formats** | ✅ | PLY · PCD · OBJ · GLB · HDR · EXR · PNG/JPG (KTX2 / VDB / USD behind `[formats]`) |
-| **3DCreator shim** | ✅ | Headless-safe monkey-patch integration — 3DCreator's UI renders through BonaFide |
-| **Render bundles** | ✅ | `.bnf` scene + camera + config snapshots round-trip for reproducibility |
+| **3DCreator shim** | ✅ | Headless-safe monkey-patch integration — 3DCreator's UI renders through BonaFide, incl. `wireframe` edges and `skeleton` rig overlay (0.2.0 API) |
+| **Render bundles** | ✅ | `.bnf` scene + camera + config snapshots round-trip bit-exact (meshes w/ UVs, clouds, volumes, softbodies, **water, particles**) |
 | **Sensor outputs** | ✅ | RGB · depth · world normals · instance IDs · GBuffer albedo as `torch.Tensor`s |
+| **GLB textures (full set)** | ✅ | All five slots — baseColor / normal / metallic-roughness / occlusion / emissive — resolve embedded, `data:`, and relative-URI sources; `KHR_texture_transform` baked into UVs; `KHR_materials_emissive_strength` honored. KTX2 stays behind `[formats]` |
+| **Anti-aliasing** | ✅ | SSAA (linear-HDR resolve) · FXAA · **TAA** (bounded-step jitter, Catmull-Rom motion-vector reprojection, depth rejection — ghost-free) · **morphological SMAA** |
+| **Upscaling** | ✅ | **FSR 1.0** (edge-adaptive EASU + RCAS sharpening, pure torch, every backend) · **DLSS** via `BONAFIDE_DLSS_DLL` NGX bridge with honest FSR fallback · EDSR checkpoint hook |
+| **Denoise** | ✅ | SVGF-style edge-aware à-trous filter guided by normals + depth; optional U-Net via `BONAFIDE_DENOISE_WEIGHTS` |
+| **SSGI** | ✅ | One-bounce screen-space GI (`neural_relight="ssgi"`): pyramid-blurred bounce, albedo bleed, depth-spread occlusion |
+| **Volumetrics** | ✅ | Uniform + height fog · trilinear grid raymarch (`Volume.from_grid`, depth-clipped) |
+| **Water** | ✅ | Gerstner-wave surfaces (`WaterSurface`): analytic plane hit, wave normals, fresnel sky/IBL reflection + sun glint, Beer absorption refraction; animates per frame |
+| **Particles** | ✅ | Deterministic CPU particle systems (`ParticleSystem`): gravity/drag/lifetime, seeded emitter respawn, age-fade splats |
 | **Differentiable render** | 🚧 | `render_differentiable()` exists (torch autograd through the CPU path); experimental |
-| **GLB embedded textures** | ✅ | Embedded / `data:` / relative-URI **baseColor** textures decode to `albedo_map` — normal/MR/AO/emissive maps, KTX2, and `KHR_texture_transform` not yet |
-| **CUDA kernel extras** | 🚧 | gsplat / nvdiffrast / Warp paths are wired but optional; `Engine.auto()` falls back to CPU when absent |
+| **CUDA kernel extras** | 🚧 | gsplat / nvdiffrast / Warp paths are wired but optional; `Engine.auto()` falls back to CPU when absent. The `bonafide_native` C++/CUDA extension (octree LOD, surfel kNN+PCA, disk-splat, async upload) builds via `scripts/build_native.py` |
 | **wgpu WGSL pipelines** | 🚧 | Backend scaffolding present; WGSL pipelines not feature-complete |
-| **TAA / SMAA** | 🚧 | Pass stubs exist; true temporal/smaa anti-aliasing not yet (FXAA works) |
-| **Neural FX / volumetrics / fluids** | 🚧 | Pass scaffolding only — denoise, upscale, relight, smoke, water are roadmap |
+| **Neural IBL relight** | 🚧 | `neural_relight="neural_ibl"` records an honest skip note; learned relighting is roadmap |
 
 ---
 

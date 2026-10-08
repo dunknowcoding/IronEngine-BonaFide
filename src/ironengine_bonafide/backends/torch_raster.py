@@ -690,6 +690,115 @@ def raster_points_rgba(
     return rgb, depth, alpha
 
 
+def raster_lines(
+    positions: torch.Tensor,            # (V, 3)
+    segments: torch.Tensor,             # (M, 2) int64 vertex pairs
+    view_proj: torch.Tensor,            # (4, 4)
+    width: int,
+    height: int,
+    *,
+    colors: torch.Tensor | None = None,     # (V, 3) per-vertex
+    color: tuple[float, float, float] = (1.0, 1.0, 1.0),   # used when colors None
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rasterize 1-px line segments with perspective-correct depth.
+
+    Segments crossing the near plane are clipped in clip space (endpoints
+    behind ``w = eps`` are pulled to the plane); the samples are DDA steps
+    at pixel resolution with NDC z interpolated affinely (correct in screen
+    space). Per-vertex colors are lerped along each segment. The depth
+    resolve follows the same determinism contract as the triangle scan
+    (amin scatter + first-candidate tiebreak).
+
+    Returns ``(rgb, depth)`` — (H, W, 3) float32 and (H, W) NDC z with
+    ``+inf`` where no line covers a pixel.
+    """
+    device = positions.device
+    positions = positions.to(torch.float32)
+    segments = segments.to(torch.long)
+    bg = torch.tensor(background, dtype=torch.float32, device=device)
+    rgb = bg.expand(height, width, 3).contiguous()
+    depth = torch.full((height, width), float("inf"), dtype=torch.float32, device=device)
+    if positions.numel() == 0 or segments.numel() == 0:
+        return rgb, depth
+    if colors is None:
+        colors = torch.tensor(color, dtype=torch.float32, device=device) \
+            .expand(positions.shape[0], 3).contiguous()
+    colors = colors.to(torch.float32)
+
+    # ---- near-plane clip in clip space --------------------------------
+    n = positions.shape[0]
+    ones = torch.ones((n, 1), dtype=torch.float32, device=device)
+    clip = torch.cat([positions, ones], dim=1) @ view_proj.to(torch.float32).T
+    a = segments[:, 0]
+    b = segments[:, 1]
+    keep = (clip[a, 3] > _NEAR_EPS) | (clip[b, 3] > _NEAR_EPS)
+    a, b = a[keep], b[keep]
+    # Pull a behind-plane endpoint exactly onto the plane (clip-space lerp).
+    for side in range(2):
+        cur, oth = (a, b) if side == 0 else (b, a)
+        w_cur = clip[cur, 3]
+        w_oth = clip[oth, 3]
+        cross = (w_cur <= _NEAR_EPS) & (w_oth > _NEAR_EPS)
+        if bool(cross.any()):
+            idx = cross.nonzero(as_tuple=False).squeeze(1)
+            t = ((_NEAR_EPS - w_cur[idx]) / (w_oth[idx] - w_cur[idx])).unsqueeze(-1)
+            clip[cur[idx]] = clip[cur[idx]] + t * (clip[oth[idx]] - clip[cur[idx]])
+    # Project clipped endpoints (float64 divide, same as _project).
+    clip64 = clip.to(torch.float64)
+    w64 = clip64[:, 3].clamp(min=_NEAR_EPS * 0.5)
+    ndc = clip64[:, :3] / w64.unsqueeze(1)
+    sx = (ndc[:, 0] * 0.5 + 0.5) * width
+    sy = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height
+    sz = ndc[:, 2]
+
+    x0, y0, z0 = sx[a], sy[a], sz[a]
+    x1, y1, z1 = sx[b], sy[b], sz[b]
+    c0, c1 = colors[a], colors[b]
+
+    # ---- DDA sampling --------------------------------------------------
+    steps = torch.ceil(torch.maximum((x1 - x0).abs(), (y1 - y0).abs())) \
+        .clamp(min=1.0).long()
+    total = int(steps.sum().item())
+    if total == 0:
+        return rgb, depth
+    seg = torch.repeat_interleave(
+        torch.arange(a.numel(), device=device), steps)
+    starts = torch.cumsum(steps, dim=0) - steps
+    k = torch.arange(total, device=device) - starts[seg]
+    t = ((k + 0.5) / steps[seg]).to(torch.float64).unsqueeze(-1)
+
+    xs = x0[seg].unsqueeze(-1) + t * (x1 - x0)[seg].unsqueeze(-1)
+    ys = y0[seg].unsqueeze(-1) + t * (y1 - y0)[seg].unsqueeze(-1)
+    zs = (z0[seg].unsqueeze(-1) + t * (z1 - z0)[seg].unsqueeze(-1)) \
+        .to(depth.dtype).squeeze(-1)
+    cs = (c0[seg] + t.to(torch.float32) * (c1 - c0)[seg])
+    px = xs.squeeze(-1).round().long()
+    py = ys.squeeze(-1).round().long()
+    valid = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    if not bool(valid.any()):
+        return rgb, depth
+    px, py, zs, cs = px[valid], py[valid], zs[valid], cs[valid]
+
+    flat = py * width + px
+    dflat = depth.reshape(-1)
+    keep2 = zs < dflat[flat]
+    if not bool(keep2.any()):
+        return rgb, depth
+    flat, zs, cs = flat[keep2], zs[keep2], cs[keep2]
+    dflat.scatter_reduce_(0, flat, zs, reduce="amin", include_self=True)
+    zb = dflat[flat]
+    win = (zs <= zb).nonzero(as_tuple=False).squeeze(1)
+    pix = flat[win]
+    pix_u, inv = torch.unique(pix, return_inverse=True)
+    first = torch.full((pix_u.numel(),), win.numel(), dtype=torch.long, device=device)
+    cand = torch.arange(win.numel(), dtype=torch.long, device=device)
+    first.scatter_reduce_(0, inv, cand, reduce="amin", include_self=True)
+    final = win[cand == first[inv]]
+    rgb.reshape(-1, 3).index_copy_(0, flat[final], cs[final])
+    return rgb, depth
+
+
 # ------------------------------------------------------------------ helpers
 def vertex_normals(positions: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Area-weighted per-vertex normals from face geometry."""

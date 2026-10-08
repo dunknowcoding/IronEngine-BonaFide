@@ -168,11 +168,18 @@ def main(argv: list[str] | None = None) -> int:
     p_render.add_argument("--config", default=None)
     p_render.add_argument("--width", type=int, default=None)
     p_render.add_argument("--height", type=int, default=None)
+    # Same option string as the global --backend: whichever is seen last
+    # wins, and the subparser default never clobbers a value already set
+    # at the top level (argparse skips defaults for existing attrs).
+    p_render.add_argument("--backend", choices=("auto", "cuda", "wgpu", "cpu"),
+                          default=None)
     p_render.set_defaults(func=cmd_render)
 
     p_bundle = sub.add_parser("bundle", help="reproduce a saved render bundle (.bnf)")
     p_bundle.add_argument("bundle")
     p_bundle.add_argument("--out", required=True)
+    p_bundle.add_argument("--backend", choices=("auto", "cuda", "wgpu", "cpu"),
+                          default=None)
     p_bundle.set_defaults(func=cmd_bundle)
 
     p_info = sub.add_parser("info", help="probe available backends")

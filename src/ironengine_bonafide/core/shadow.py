@@ -339,6 +339,49 @@ def offset_along_normal(world_pos: torch.Tensor, normals: torch.Tensor,
     return world_pos + normals * (float(texel_size_world) * float(offset_texels))
 
 
+# --------------------------------------------------------------- VSM
+def vsm_moments_from_depth(depth: torch.Tensor, *, blur_passes: int = 2) -> torch.Tensor:
+    """Convert a rasterised depth map (H, W, NDC z, +inf empty) into the
+    two VSM moment maps stacked as (H, W, 2): blurred E[z] and E[z²].
+
+    Empty texels are treated as the far plane (z = 1) so the blur stays
+    finite; the blur is the same separable [1,4,6,4,1]/16 gaussian the
+    bloom pass uses, applied ``blur_passes`` times for a wider kernel.
+    """
+    from ironengine_bonafide.passes.postprocess import _blur5
+
+    d = torch.where(torch.isfinite(depth), depth, torch.ones_like(depth))
+    m1 = d.unsqueeze(-1)
+    m2 = (d * d).unsqueeze(-1)
+    moments = torch.cat([m1, m2], dim=-1)
+    for _ in range(max(0, int(blur_passes))):
+        moments = _blur5(moments)
+    return moments
+
+
+def vsm_visibility(moments: torch.Tensor, uv: torch.Tensor,
+                   current_depth: torch.Tensor, *,
+                   bias: float = 0.0, light_bleeding: float = 0.2) -> torch.Tensor:
+    """Chebyshev-inequality visibility from a VSM moments map.
+
+    ``moments`` is (H, W, 2) (blurred E[z], E[z²]); ``uv`` is (..., 2) in
+    [0, 1]; ``current_depth`` is (...,) fragment light-NDC z. Returns
+    fractional visibility in [0, 1] — soft penumbrae by construction.
+    ``light_bleeding`` remaps the lower range to suppress the classic VSM
+    light-bleeding artifact.
+    """
+    h, w = moments.shape[:2]
+    px = (uv[..., 0].clamp(0.0, 1.0) * w).round().long().clamp(0, w - 1)
+    py = ((1.0 - uv[..., 1].clamp(0.0, 1.0)) * h).round().long().clamp(0, h - 1)
+    m = moments[py, px]
+    mu = m[..., 0]
+    sigma2 = (m[..., 1] - mu * mu).clamp(min=1e-7)
+    z = current_depth - float(bias)
+    d = (z - mu).clamp(min=0.0)
+    lit = torch.where(z <= mu, torch.ones_like(mu), sigma2 / (sigma2 + d * d))
+    return ((lit - float(light_bleeding)) / (1.0 - float(light_bleeding))).clamp(0.0, 1.0)
+
+
 # --------------------------------------------------------------- PCF
 def pcf_sample(depth_map: torch.Tensor, uv: torch.Tensor, current_depth: torch.Tensor,
                *, bias: float = 0.005, radius: int = 1,

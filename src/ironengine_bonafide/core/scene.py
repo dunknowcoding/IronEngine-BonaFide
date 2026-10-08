@@ -19,11 +19,13 @@ from ironengine_bonafide.core.light import (
     SpotLight,
 )
 from ironengine_bonafide.core.mesh import Mesh
+from ironengine_bonafide.core.particles import ParticleSystem
 from ironengine_bonafide.core.pointcloud import PointCloud
 from ironengine_bonafide.core.softbody import DollRig
 from ironengine_bonafide.core.volume import Volume
+from ironengine_bonafide.core.water import WaterSurface
 
-Renderable = Mesh | PointCloud | Volume | DollRig | Light
+Renderable = Mesh | PointCloud | Volume | DollRig | Light | WaterSurface | ParticleSystem
 
 # Tuple of concrete light classes — narrower than `hasattr("kind")` and
 # safe against accidental scene contamination.
@@ -75,6 +77,8 @@ class Scene:
     pointclouds: list[PointCloud] = field(default_factory=list)
     volumes: list[Volume] = field(default_factory=list)
     softbodies: list[DollRig] = field(default_factory=list)
+    waters: list[WaterSurface] = field(default_factory=list)
+    particles: list[ParticleSystem] = field(default_factory=list)
     lights: list[Light] = field(default_factory=list)
     ibl: IBL | None = None
     background: Background | None = field(default_factory=Background)
@@ -89,6 +93,10 @@ class Scene:
             self.volumes.append(item)
         elif isinstance(item, DollRig):
             self.softbodies.append(item)
+        elif isinstance(item, WaterSurface):
+            self.waters.append(item)
+        elif isinstance(item, ParticleSystem):
+            self.particles.append(item)
         elif isinstance(item, IBL):
             self.ibl = item
         elif isinstance(item, Background):
@@ -135,6 +143,8 @@ class Scene:
             pointclouds=[p.to(device) for p in self.pointclouds],
             volumes=self.volumes,           # volumes carry their own grid lazily
             softbodies=self.softbodies,
+            waters=self.waters,
+            particles=self.particles,
             lights=self.lights,
             ibl=self.ibl,
             background=self.background,

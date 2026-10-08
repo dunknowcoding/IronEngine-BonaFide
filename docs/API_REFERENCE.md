@@ -135,12 +135,15 @@ class RenderConfig:
     device:              "auto"|"cuda"|"wgpu"|"cpu"|"mps" = "auto"
     vram_budget_mb:      float = 4096.0
     seed: int = 0
-    shadows: "off"|"csm"|"vsm" = "csm"
+    shadows: "off"|"csm"|"vsm" = "csm"   # csm = cascaded PCF maps;
+                                         # vsm = variance maps (soft penumbra)
     # --- anti-aliasing ---
     aa: "off"|"fxaa"|"taa"|"smaa" = "fxaa"
     ssaa: int = 1                     # full-scene supersample factor 1/2/4;
                                       # renders at ssaa× and area-averages down
                                       # (linear HDR) before post passes
+    taa_alpha: float = 0.1            # TAA: weight of the CURRENT frame (0, 1]
+    taa_jitter_frames: int = 8        # TAA: Halton jitter period (>= 2)
     # --- bloom / glow ---
     bloom:   bool = True
     bloom_threshold: float = 1.0      # HDR knee; only brighter pixels glow
@@ -161,9 +164,16 @@ class RenderConfig:
     lod:        LodConfig
     completion: CompletionConfig
     fog:        FogConfig
-    neural_denoise: bool = False
+    neural_denoise: bool = False      # edge-aware à-trous denoiser (GBuffer-guided);
+                                      # uses BONAFIDE_DENOISE_WEIGHTS U-Net if present
     neural_upscale: "none"|"fsr"|"dlss" = "none"
+    upscale_factor: float = 2.0       # output px per internal px, [1, 4]; the
+                                      # engine renders at 1/factor internally
+    upscale_sharpness: float = 0.2    # RCAS sharpening strength [0, 1]
     neural_relight: "none"|"ssgi"|"neural_ibl" = "none"
+    ssgi_intensity: float = 0.5       # indirect bounce gain for "ssgi"
+    simulation_dt: float = 1/60       # per-render frame step (water waves,
+                                      # particle sim), seconds, > 0
     differentiable: bool = False
     profile: bool = False
 ```
@@ -272,18 +282,21 @@ PerspectiveCamera(
     fov_deg:  float = 45.0,
     near:     float = 0.05,
     far:      float = 200.0,
-)
+    jitter_ndc: tuple[float, float] = (0.0, 0.0),   # sub-pixel NDC jitter,
+)                                                   # driven by TAA; leave at 0
 ```
 
 ### `OrthographicCamera`
 ```python
 OrthographicCamera(position, look_at, up=(0,1,0),
-                   half_width=2.0, half_height=2.0, near=0.05, far=200)
+                   half_width=2.0, half_height=2.0, near=0.05, far=200,
+                   jitter_ndc=(0.0, 0.0))
 ```
 
 ### `SensorCamera`
 ```python
-SensorCamera(pose: np.ndarray (4,4), fov_deg=60, near=0.05, far=200)
+SensorCamera(pose: np.ndarray (4,4), fov_deg=60, near=0.05, far=200,
+             jitter_ndc=(0.0, 0.0))
 ```
 
 All three expose:
@@ -365,6 +378,32 @@ Volume.fog(density=0.02, color=(0.7,0.78,0.86), height_falloff=0.0)
 Volume.from_vdb(path)                       # requires [formats]
 Volume.from_grid(grid: ndarray (D,H,W), origin=(0,0,0), voxel_size=0.1)
 ```
+
+### `WaterSurface`
+```python
+WaterSurface(
+    center=(0,0,0), normal=(0,1,0), half_size=(20,20),
+    wave_amplitude=0.06, wave_length=1.7, wave_speed=1.2, steepness=0.5,
+    time=0.0,                              # advances simulation_dt per render
+    color=(0.02,0.10,0.14), scatter_color=(0.05,0.22,0.24),
+    reflectivity=1.0,
+)
+```
+Gerstner-wave plane: fresnel sky/IBL reflection + sun glint, Beer-absorbed
+refraction; writes rgb/depth/normals/albedo.
+
+### `ParticleSystem`
+```python
+ParticleSystem(positions (N,3), velocities=None, ages=None,
+               lifetime=2.0, gravity=(0,-9.8,0), drag=0.05,
+               emitter_position=(0,0,0), emitter_spread=0.3,
+               emitter_velocity=(0,1.5,0), respawn=True,
+               color=(1.0,0.75,0.35), size_px=3.0)
+ParticleSystem.from_arrays(positions, velocities=None, **kw)
+ParticleSystem.fountain(n=256, **kw)      # clustered at the emitter
+```
+Deterministic CPU sim (gravity/drag/lifetime, seeded respawn) + age-faded
+depth-tested splats.
 
 ### `DollRig`
 ```python
@@ -551,24 +590,28 @@ class RenderPass(ABC):
 
 Built-in passes (all in `ironengine_bonafide.passes.*`):
 
-| Pass               | Module               | Required capability    |
-|--------------------|----------------------|------------------------|
-| `CsmShadowPass`    | `shadow`             | `shadow_csm`           |
-| `SoftBodyPass`     | `softbody_pass`      | `warp_xpbd`            |
-| `CompletionPass`   | `completion_pass`    | (asks `neural_field`)  |
-| `SplatPass`        | `splat_pass`         | `splat`                |
-| `PbrPass`          | `pbr_pass`           | `raster`               |
-| `ParticlePass`     | `particle_pass`      | `warp_xpbd`            |
-| `WaterPass`        | `water_pass`         |                        |
-| `VolumetricPass`   | `volumetric_pass`    |                        |
-| `NeuralRelightPass`| `neural_relight`     |                        |
-| `FxaaPass`         | `postprocess`        |                        |
-| `TaaPass`          | `aa_pass`            |                        |
-| `SmaaPass`         | `aa_pass`            |                        |
-| `BloomPass`        | `postprocess`        |                        |
-| `NeuralDenoisePass`| `neural_denoise`     |                        |
-| `NeuralUpscalePass`| `neural_upscale`     |                        |
-| `TonemapPass`      | `postprocess`        |                        |
+| Pass               | Module               | Required capability    | Notes |
+|--------------------|----------------------|------------------------|-------|
+| `SkyPass`          | `sky_pass`           |                        | solid / gradient / envmap backgrounds |
+| `CsmShadowPass`    | `shadow`             | `shadow_csm`           | |
+| `SoftBodyPass`     | `softbody_pass`      | `warp_xpbd`            | |
+| `LodPass`          | `lod_pass`           |                        | |
+| `CompletionPass`   | `completion_pass`    | (asks `neural_field`)  | |
+| `SplatPass`        | `splat_pass`         | `splat`                | |
+| `PbrPass`          | `pbr_pass`           | `raster`               | samples all five glTF texture slots incl. emissive maps |
+| `ParticlePass`     | `particle_pass`      | `warp_xpbd`            | roadmap stub |
+| `WaterPass`        | `water_pass`         |                        | roadmap stub |
+| `VolumetricPass`   | `volumetric_pass`    |                        | uniform fog + trilinear grid raymarch |
+| `NeuralRelightPass`| `neural_relight`     |                        | SSGI-lite one-bounce GI |
+| `SsaaDownsamplePass`| `aa_pass`           |                        | linear-HDR area resolve |
+| `FxaaPass`         | `postprocess`        |                        | |
+| `TaaPass`          | `aa_pass`            |                        | Halton jitter + clamped history |
+| `SmaaPass`         | `aa_pass`            |                        | morphological (run-length) AA |
+| `GodRaysPass`      | `godrays_pass`       |                        | |
+| `BloomPass`        | `postprocess`        |                        | |
+| `NeuralDenoisePass`| `neural_denoise`     |                        | à-trous GBuffer-guided; U-Net with weights |
+| `NeuralUpscalePass`| `neural_upscale`     |                        | FSR 1.0 EASU+RCAS; DLSS bridge hook |
+| `TonemapPass`      | `postprocess`        |                        | |
 
 Replace the default graph:
 

@@ -17,7 +17,7 @@
 7. [Meshes & Materials](#7-meshes--materials)
 8. [Volumes, Particles, Soft Bodies](#8-volumes-particles-soft-bodies)
 9. [Lighting](#9-lighting)
-9A. [Visual Quality — AA, Bloom, God Rays, Glass, Sky Discs](#9a-visual-quality--aa-bloom-god-rays-glass-sky-discs)
+9A. [Visual Quality — AA, Upscaling, Denoise, SSGI, Bloom, God Rays, Glass, Sky Discs](#9a-visual-quality--aa-upscaling-denoise-ssgi-bloom-god-rays-glass-sky-discs)
 10. [Differentiable Rendering](#10-differentiable-rendering)
 11. [3DCreator Integration](#11-3dcreator-integration)
 12. [Render Bundles](#12-render-bundles)
@@ -30,7 +30,6 @@
 ## 1. Installation
 
 ```bash
-conda activate IronEngineWorld
 pip install -e .[all]
 ```
 
@@ -222,7 +221,7 @@ keep their raw colors.
 
 ---
 
-## 8. Volumes, Particles, Soft Bodies
+## 8. Volumes, Water, Particles, Soft Bodies
 
 ```python
 Volume.fog(density=0.02, color=(0.7, 0.78, 0.86))
@@ -233,8 +232,44 @@ DollRig.from_glb("character.glb").as_softbody(stiffness=0.8)
 DollRig.from_arrays(particles=verts, edges=edges, stiffness=0.7)
 ```
 
-Particles + fluids land via NVIDIA Warp (XPBD / FLIP). Pass slots ship in v0.1
-and gracefully skip when `warp-lang` isn't installed.
+Fog volumes render as single-scatter exponential fog (with optional height
+falloff). Grid volumes — `Volume.from_grid`, and VDB grids once the
+`[formats]` extra loads them — are **raymarched trilinearly** with
+front-to-back emission/absorption; scene depth clips the march so geometry
+occludes the volume and the volume occludes the sky.
+
+### Water
+
+```python
+scene.add(WaterSurface(
+    center=(0, 0, 0), half_size=(20, 20),
+    wave_amplitude=0.06, wave_length=1.7, wave_speed=1.2, steepness=0.5,
+    color=(0.02, 0.10, 0.14), scatter_color=(0.05, 0.22, 0.24),
+))
+```
+
+`WaterSurface` renders a Gerstner-wave plane: analytic ray/plane hit,
+three directional wave components for the surface normal, Schlick fresnel
+between sky/IBL **reflection** (plus a sun glint from the first
+`DirectionalLight`) and Beer-absorbed **refraction** of whatever is behind
+the surface. `WaterSurface.time` advances by `RenderConfig.simulation_dt`
+(default 1/60 s) on every `render()` — repeated calls animate the waves
+deterministically. The surface writes depth/normals/albedo, so SSGI,
+denoise, and fog treat it as scene geometry.
+
+### Particles
+
+```python
+ps = ParticleSystem.fountain(
+    256, emitter_position=(0, 0.2, 0), emitter_velocity=(0, 2.5, 0),
+    lifetime=2.0, color=(1.0, 0.75, 0.35))
+scene.add(ps)
+```
+
+CPU-simulated point sprites: gravity + drag + lifetime per
+`simulation_dt` step, seeded emitter respawn (bit-exact given the same
+`RenderConfig.seed`), age-faded depth-tested splats. Positions and
+velocities round-trip through render bundles.
 
 ---
 
@@ -248,9 +283,24 @@ AreaLight(position=(0,2,0), normal=(0,-1,0), extent=(1,1), intensity=4)
 IBL.from_hdr("studio_4k.hdr", intensity=1.2)
 ```
 
+Directional lights cast shadows; pick the algorithm per render:
+
+```python
+RenderConfig(shadows="csm")   # cascaded shadow maps (default): texel-snapped
+                              # frusta, world-space slope bias, 3x3 PCF
+RenderConfig(shadows="vsm")   # variance shadow maps: blurred depth moments +
+                              # Chebyshev test — soft penumbrae, no acne
+RenderConfig(shadows="off")
+```
+
+`AreaLight` is a real rectangular emitter, not a point in disguise: the
+rectangle (`extent`, facing `normal`) is sampled on a 3×3 grid with
+inverse-square falloff and one-sided emission — wider extents give visibly
+softer, more spread shading.
+
 ---
 
-## 9A. Visual Quality — AA, Bloom, God Rays, Glass, Sky Discs
+## 9A. Visual Quality — AA, Upscaling, Denoise, SSGI, Bloom, God Rays, Glass, Sky Discs
 
 All of these are **opt-in config fields** (or default-off `Background` flags);
 with every default untouched the renderer is bit-identical to before.
@@ -260,6 +310,8 @@ with every default untouched the renderer is bit-identical to before.
 ```python
 RenderConfig(ssaa=4)          # render 4× larger, area-average down (linear HDR)
 RenderConfig(aa="fxaa")       # default: luma-edge post blend after resolve
+RenderConfig(aa="taa", taa_alpha=0.1, taa_jitter_frames=8)   # temporal AA
+RenderConfig(aa="smaa")       # morphological AA (SMAA family)
 ```
 
 - `ssaa` (1/2/4) is full-scene supersampling: geometry passes render at
@@ -268,6 +320,74 @@ RenderConfig(aa="fxaa")       # default: luma-edge post blend after resolve
   use block-centre nearest.
 - `aa="fxaa"` blends each pixel toward its 3×3 average with a weight ∝ the
   local luma contrast (capped 0.5); flat regions pass through bit-exact.
+- `aa="taa"` is true temporal AA: the render driver applies a bounded-step
+  sub-pixel jitter (8-phase sequence, ~0.35 px radius, ≤0.27 px steps) to
+  the camera projection every frame, and the pass **reprojects** the
+  history with per-pixel motion vectors (Catmull-Rom sampling — no
+  diffusion blur) and **depth-rejects** it where the surface actually
+  moved, so moving objects leave no ghost trail while static content
+  converges to SSAA-class edges in ~8 frames. `taa_alpha` sets the
+  current-frame weight. History resets automatically when the camera or
+  resolution changes. Use it for stills and turntable sequences rendered
+  through repeated `render()` calls on one `Engine`.
+- `aa="smaa"` is a single-pass morphological AA in the SMAA family: luma
+  edges are detected, measured by run length, and cross-blended (long
+  staircase edges blend strongest, texture detail barely moves). It does
+  not use Jimenez's precomputed area textures, so it is not bit-equal to
+  reference SMAA.
+
+### Upscaling (FSR 1.0 / DLSS)
+
+```python
+RenderConfig(neural_upscale="fsr", upscale_factor=2.0, upscale_sharpness=0.2)
+RenderConfig(neural_upscale="dlss")   # needs an NGX bridge DLL, else → FSR
+```
+
+With upscaling enabled the engine renders internally at
+`1/upscale_factor` of the output resolution and the upscale pass resolves
+to full size before tonemapping (sensor outputs — depth/normals/ids/albedo
+— are resolved alongside with mode-appropriate filters).
+
+- `"fsr"` is an AMD FSR 1.0–style implementation in pure torch: **EASU**
+  (edge-adaptive 16-tap Lanczos2 upsampling, anisotropic along edges) +
+  **RCAS** (contrast-adaptive sharpening with anti-halo clamp). Faithful to
+  the published algorithm's structure, deterministic, runs on every backend.
+- `"dlss"` drives NVIDIA DLSS through a user-supplied bridge DLL pointed to
+  by `BONAFIDE_DLSS_DLL` (DLSS is proprietary and cannot be redistributed —
+  the bridge must export `bonafide_dlss_upscale(src, dst, sw, sh, dw, dh)`
+  over float32 HWC RGB buffers, and a Turing-or-newer NVIDIA GPU must be
+  present). When unavailable, the pass **honestly falls back to FSR** and
+  records `neural_upscale:dlss_unavailable→fsr` in
+  `RenderOutputs.skipped_passes`.
+- `BONAFIDE_UPSCALE_WEIGHTS=<path>` overrides both with a trained
+  EDSR-style checkpoint.
+- `upscale_factor > 1` is mutually exclusive with `ssaa > 1` (both change
+  the internal resolution).
+
+### Denoising
+
+```python
+RenderConfig(neural_denoise=True)
+```
+
+An SVGF-style edge-aware à-trous wavelet filter (3 dilated iterations)
+guided by the engine's own GBuffer — colour distance, world-normal
+disagreement, and relative depth discontinuity all damp the blur, so noise
+collapses while geometric edges stay put. No weights required. When
+`BONAFIDE_DENOISE_WEIGHTS` points at a trained checkpoint, the bundled
+micro U-Net is used instead.
+
+### Screen-space GI (SSGI-lite)
+
+```python
+RenderConfig(neural_relight="ssgi", ssgi_intensity=0.5)
+```
+
+A one-bounce diffuse GI approximation: the lit frame is blurred through a
+gaussian pyramid and gathered back as indirect irradiance, modulated by
+albedo (colourbleed), a normal-hemisphere weight, and a depth-spread
+occlusion term. Only geometry pixels receive bounce — the sky never does.
+`neural_relight="neural_ibl"` remains roadmap and records a skip note.
 
 ### Bloom / glow
 
@@ -366,7 +486,15 @@ ironengine_3d_creator.rendering.api.render_mesh_offscreen   → BonaFide
 ```
 
 The shim mirrors the orbit-yaw-pitch-distance preview math 3DCreator's UI
-authored, so the user sees identical framing.
+authored, so the user sees identical framing. It matches the 3DCreator
+0.2.0 API, including the optional kwargs:
+
+```python
+render_mesh_offscreen(pos, idx, normals, colors, options=opts,
+                      wireframe=True)               # edges as 1-px lines
+render_mesh_offscreen(pos, idx, normals, colors, options=opts,
+                      skeleton=(joints, parents))   # white rig + orange joints
+```
 
 Use the engine programmatically:
 

@@ -167,8 +167,13 @@ def ray_directions(
 
     fov = math.radians(getattr(camera, "fov_deg", 45.0))
     tan_half = math.tan(fov * 0.5)
-    ndc_x = ((xx + 0.5) / width) * 2.0 - 1.0
-    ndc_y = 1.0 - ((yy + 0.5) / height) * 2.0
+    # TAA jitter (NDC): the projection's m[0,2]/m[1,2] shift moves content
+    # by −j in NDC, so pixel (xx, yy) with the jittered frustum sees the
+    # unjittered ray at ndc + j — keep the sky aligned with the geometry
+    # passes, which receive the jitter via view_proj.
+    jx, jy = getattr(camera, "jitter_ndc", (0.0, 0.0))
+    ndc_x = ((xx + 0.5) / width) * 2.0 - 1.0 + jx
+    ndc_y = 1.0 - ((yy + 0.5) / height) * 2.0 + jy
     dir_cam = torch.stack([
         ndc_x * tan_half * aspect,
         ndc_y * tan_half,

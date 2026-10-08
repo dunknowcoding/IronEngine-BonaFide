@@ -87,6 +87,11 @@ class RenderConfig:
     # ssaa = full-scene supersampling: geometry renders at ssaa× the output
     # resolution and is area-averaged down before post passes. 1 = off.
     ssaa: int = 1
+    # TAA (aa="taa"): Halton-2,3 sub-pixel jitter + exponential history
+    # blend with 3x3 neighbourhood clamping. History lives on the TaaPass
+    # instance and resets when camera / resolution / jitter phase changes.
+    taa_alpha: float = 0.1            # weight of the CURRENT frame (0, 1]
+    taa_jitter_frames: int = 8        # jitter sequence period (frames)
     # ---- bloom / glow --------------------------------------------------
     bloom: bool = True
     bloom_threshold: float = 1.0            # HDR knee; only brighter pixels glow
@@ -110,10 +115,20 @@ class RenderConfig:
     completion: CompletionConfig = field(default_factory=CompletionConfig)
     # ---- volumes -------------------------------------------------------
     fog: FogConfig = field(default_factory=FogConfig)
+    # ---- simulation (water animation, particles) -----------------------
+    simulation_dt: float = 1.0 / 60.0   # per-render frame step, seconds
     # ---- neural FX -----------------------------------------------------
     neural_denoise: bool = False
+    # Spatial upscaler: geometry renders at 1/upscale_factor of the output
+    # resolution and the upscale pass resolves to full size before tonemap.
+    #   "fsr"  — AMD FSR 1.0 (EASU + RCAS), pure torch, runs everywhere
+    #   "dlss" — NVIDIA DLSS via an NGX bridge DLL (BONAFIDE_DLSS_DLL);
+    #            falls back to FSR with a skip note when unavailable
     neural_upscale: NeuralUpscale = "none"
+    upscale_factor: float = 2.0       # output px per internal px, [1, 4]
+    upscale_sharpness: float = 0.2    # RCAS sharpening strength, [0, 1]
     neural_relight: NeuralRelight = "none"
+    ssgi_intensity: float = 0.5       # indirect bounce gain for "ssgi"
     # ---- differentiable ------------------------------------------------
     differentiable: bool = False
     # ---- profiling -----------------------------------------------------
@@ -194,6 +209,33 @@ class RenderConfig:
             )
         if self.neural_upscale not in ("none", "fsr", "dlss"):
             raise ConfigurationError(f"neural_upscale='{self.neural_upscale}' invalid")
+        if not (1.0 <= self.upscale_factor <= 4.0):
+            raise ConfigurationError(
+                f"upscale_factor must be in [1, 4] (got {self.upscale_factor})"
+            )
+        if not (0.0 <= self.upscale_sharpness <= 1.0):
+            raise ConfigurationError(
+                f"upscale_sharpness must be in [0, 1] (got {self.upscale_sharpness})"
+            )
+        if self.neural_upscale != "none" and self.upscale_factor > 1.0 and self.ssaa > 1:
+            raise ConfigurationError(
+                "ssaa > 1 and neural_upscale are mutually exclusive "
+                "(both change the internal render resolution)"
+            )
+        if not (0.0 < self.taa_alpha <= 1.0):
+            raise ConfigurationError(f"taa_alpha must be in (0, 1] (got {self.taa_alpha})")
+        if self.taa_jitter_frames < 2:
+            raise ConfigurationError(
+                f"taa_jitter_frames must be >= 2 (got {self.taa_jitter_frames})"
+            )
+        if self.ssgi_intensity < 0.0:
+            raise ConfigurationError(
+                f"ssgi_intensity must be >= 0 (got {self.ssgi_intensity})"
+            )
+        if self.simulation_dt <= 0.0:
+            raise ConfigurationError(
+                f"simulation_dt must be > 0 (got {self.simulation_dt})"
+            )
         if self.neural_relight not in ("none", "ssgi", "neural_ibl"):
             raise ConfigurationError(f"neural_relight='{self.neural_relight}' invalid")
 

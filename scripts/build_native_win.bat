@@ -3,11 +3,13 @@ REM ====================================================================
 REM  build_native_win.bat - build bonafide_native on Windows
 REM
 REM  Activates the VS 2022 Build Tools x64 environment, puts a known-good
-REM  CMake + Ninja first on PATH (so a stray MinGW gcc / STM32 toolchain
+REM  CMake + Ninja first on PATH (so a stray MinGW gcc or other toolchain
 REM  doesn't get auto-picked), forces the MSVC host compiler, and builds
 REM  with the Ninja generator (no VS .props integration required).
 REM
 REM  Usage:   scripts\build_native_win.bat [Release|Debug]
+REM  Python:  set BONAFIDE_PYTHON=C:\path\to\python.exe to choose the
+REM           interpreter (default: first python.exe on PATH).
 REM ====================================================================
 setlocal EnableDelayedExpansion
 
@@ -17,10 +19,20 @@ if "%CFG%"=="" set "CFG=Release"
 set "REPO=%~dp0.."
 set "NATIVE=%REPO%\native"
 set "BUILD=%NATIVE%\build"
-set "PYEXE=G:\Anaconda\envs\IronEngineWorld\python.exe"
+REM Python to build against: set BONAFIDE_PYTHON to override, otherwise the
+REM first python.exe on PATH is used.
+if "%BONAFIDE_PYTHON%"=="" (
+    for /f "delims=" %%i in ('where python.exe 2^>nul') do (
+        if not defined BONAFIDE_PYTHON set "BONAFIDE_PYTHON=%%i"
+    )
+)
+if "%BONAFIDE_PYTHON%"=="" (
+    echo ERROR: no python.exe on PATH; set BONAFIDE_PYTHON to your interpreter.
+    exit /b 1
+)
+set "PYEXE=%BONAFIDE_PYTHON%"
 set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-set "CMAKE_BIN=C:\ST\STM32CubeCLT_1.19.0\CMake\bin"
-set "NINJA_BIN=C:\ST\STM32CubeCLT_1.19.0\Ninja\bin"
+set "CMAKE_BIN=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
 
 echo === activating VS 2022 x64 toolchain ===
 call "%VCVARS%" x64
@@ -29,8 +41,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Put cmake + ninja FIRST so stray toolchains lose the lookup race.
-set "PATH=%CMAKE_BIN%;%NINJA_BIN%;%PATH%"
+REM Put system CMake and the CUDA toolkit first; vcvars supplies Ninja + cl.
+if "%CUDA_PATH%"=="" set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+set "PATH=%CMAKE_BIN%;%CUDA_PATH%\bin;%PATH%"
 
 where cl.exe >nul 2>&1
 if errorlevel 1 (
@@ -41,15 +54,11 @@ echo cl.exe:    & where cl.exe
 echo cmake:     & where cmake
 echo ninja:     & where ninja
 
-REM Bridge the CUDA 11.7 <-> MSVC 14.44 version gap. Two independent
-REM version gates have to be silenced:
-REM   1. nvcc's own host_config.h check  -> -allow-unsupported-compiler
-REM   2. the MSVC STL's STL1002 assert   -> -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
-REM NVCC_PREPEND_FLAGS is honoured by EVERY nvcc invocation, including
-REM CMake's compiler-ID probe (which ignores -DCMAKE_CUDA_FLAGS).
-REM Safe for the small, STL-light kernels we author. The clean long-term
-REM fix is CUDA >= 12.4 (matches this MSVC) - see native/README.md.
-set "NVCC_PREPEND_FLAGS=-allow-unsupported-compiler -Xcompiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+REM Only CUDA < 12.4 needs the MSVC version-gap workarounds; CUDA 13.x
+REM officially supports this MSVC, so no NVCC_PREPEND_FLAGS are set here.
+REM (For CUDA 11.7 use:
+REM   set NVCC_PREPEND_FLAGS=-allow-unsupported-compiler -Xcompiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+REM )
 
 echo.
 echo === configure (Ninja, %CFG%) ===

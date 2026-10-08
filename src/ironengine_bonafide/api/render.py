@@ -75,7 +75,13 @@ def _do_render(
     # Full-scene supersampling: geometry passes work on an ssaa× frame;
     # SsaaDownsamplePass resolves it to the requested size before post.
     ssaa = int(getattr(config, "ssaa", 1))
-    h, w = config.height * ssaa, config.width * ssaa
+    # Spatial upscaling (FSR / DLSS): geometry renders at 1/upscale_factor
+    # of the output size; NeuralUpscalePass resolves to full resolution.
+    upscale_div = 1.0
+    if config.neural_upscale != "none":
+        upscale_div = float(getattr(config, "upscale_factor", 2.0))
+    h = max(1, int(round(config.height * ssaa / upscale_div)))
+    w = max(1, int(round(config.width * ssaa / upscale_div)))
     device = backend.device
 
     targets = FrameTargets(
@@ -101,27 +107,46 @@ def _do_render(
                    engine=engine, scene=scene, camera=camera,
                    config=config, differentiable=differentiable)
 
-    for ps in engine.passes:
-        if not ps.is_active(ctx):
-            ctx.skipped.append(f"{ps.name}:disabled")
-            continue
-        missing = [c for c in ps.required_capabilities() if not backend.supports(c)]
-        if missing:
-            ctx.skipped.append(f"{ps.name}:missing[{','.join(missing)}]")
-            continue
-        lifecycle.fire("on_pass_begin", engine=engine, pass_name=ps.name, ctx=ctx)
-        try:
-            if report is not None:
-                with stopwatch(report, ps.name):
+    # TAA: apply this frame's sub-pixel jitter to the camera projection so
+    # every geometry pass (and the sky's analytic rays) samples a different
+    # sub-pixel location; TaaPass blends the result into its history.
+    taa_pass = None
+    if config.aa == "taa":
+        from ironengine_bonafide.passes.aa_pass import TaaPass
+        for ps in engine.passes:
+            if isinstance(ps, TaaPass):
+                taa_pass = ps
+                break
+    prev_jitter: tuple[float, float] = (0.0, 0.0)
+    if taa_pass is not None and hasattr(camera, "jitter_ndc"):
+        prev_jitter = tuple(getattr(camera, "jitter_ndc", (0.0, 0.0)))  # type: ignore[arg-type]
+        camera.jitter_ndc = taa_pass.next_jitter(camera, w, h, config)  # type: ignore[attr-defined]
+
+    try:
+        for ps in engine.passes:
+            if not ps.is_active(ctx):
+                ctx.skipped.append(f"{ps.name}:disabled")
+                continue
+            missing = [c for c in ps.required_capabilities() if not backend.supports(c)]
+            if missing:
+                ctx.skipped.append(f"{ps.name}:missing[{','.join(missing)}]")
+                continue
+            lifecycle.fire("on_pass_begin", engine=engine, pass_name=ps.name, ctx=ctx)
+            try:
+                if report is not None:
+                    with stopwatch(report, ps.name):
+                        ps.run(ctx)
+                else:
                     ps.run(ctx)
-            else:
-                ps.run(ctx)
-        except Exception as exc:
-            lifecycle.fire("on_error", engine=engine, pass_name=ps.name,
-                           exception=exc, ctx=ctx)
-            logger.exception(f"pass '{ps.name}' raised {type(exc).__name__}: {exc}")
-            raise PassError(f"pass '{ps.name}' failed: {exc}") from exc
-        lifecycle.fire("on_pass_end", engine=engine, pass_name=ps.name, ctx=ctx)
+            except Exception as exc:
+                lifecycle.fire("on_error", engine=engine, pass_name=ps.name,
+                               exception=exc, ctx=ctx)
+                logger.exception(f"pass '{ps.name}' raised {type(exc).__name__}: {exc}")
+                raise PassError(f"pass '{ps.name}' failed: {exc}") from exc
+            lifecycle.fire("on_pass_end", engine=engine, pass_name=ps.name, ctx=ctx)
+    finally:
+        if taa_pass is not None and hasattr(camera, "jitter_ndc"):
+            camera.jitter_ndc = prev_jitter  # type: ignore[attr-defined]
 
     rgb = _OutputTensor(targets.rgb)
     out = RenderOutputs(

@@ -40,6 +40,7 @@ coverage.xml
 Thumbs.db
 
 # Project artifacts
+_work/
 profile_runs/
 *.bnf.cache
 tests/_diff_outputs/

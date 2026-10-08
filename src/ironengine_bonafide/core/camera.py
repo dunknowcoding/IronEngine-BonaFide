@@ -65,12 +65,21 @@ class PerspectiveCamera:
     fov_deg: float = 45.0
     near: float = 0.05
     far: float = 200.0
+    # Sub-pixel projection jitter in NDC units, set by the TAA driver each
+    # frame. (0, 0) = centered pixels (default, legacy behavior).
+    jitter_ndc: tuple[float, float] = (0.0, 0.0)
 
     def view_matrix(self) -> np.ndarray:
         return look_at(self.position, self.look_at, self.up)
 
     def proj_matrix(self, aspect: float) -> np.ndarray:
-        return perspective(self.fov_deg, aspect, self.near, self.far)
+        m = perspective(self.fov_deg, aspect, self.near, self.far)
+        jx, jy = self.jitter_ndc
+        if jx or jy:
+            # Frustum shift: x_ndc' = x_ndc + jx (standard TAA jitter).
+            m[0, 2] += jx
+            m[1, 2] += jy
+        return m
 
     def view_proj(self, aspect: float) -> np.ndarray:
         return self.proj_matrix(aspect) @ self.view_matrix()
@@ -88,12 +97,19 @@ class OrthographicCamera:
     half_height: float = 2.0
     near: float = 0.05
     far: float = 200.0
+    # Sub-pixel projection jitter in NDC units (see PerspectiveCamera).
+    jitter_ndc: tuple[float, float] = (0.0, 0.0)
 
     def view_matrix(self) -> np.ndarray:
         return look_at(self.position, self.look_at, self.up)
 
     def proj_matrix(self, _aspect: float) -> np.ndarray:
-        return orthographic(self.half_width, self.half_height, self.near, self.far)
+        m = orthographic(self.half_width, self.half_height, self.near, self.far)
+        jx, jy = self.jitter_ndc
+        if jx or jy:
+            m[0, 3] += jx
+            m[1, 3] += jy
+        return m
 
     def view_proj(self, aspect: float) -> np.ndarray:
         return self.proj_matrix(aspect) @ self.view_matrix()
@@ -109,12 +125,19 @@ class SensorCamera:
     fov_deg: float = 60.0
     near: float = 0.05
     far: float = 200.0
+    # Sub-pixel projection jitter in NDC units (see PerspectiveCamera).
+    jitter_ndc: tuple[float, float] = (0.0, 0.0)
 
     def view_matrix(self) -> np.ndarray:
         return np.linalg.inv(self.pose)
 
     def proj_matrix(self, aspect: float) -> np.ndarray:
-        return perspective(self.fov_deg, aspect, self.near, self.far)
+        m = perspective(self.fov_deg, aspect, self.near, self.far)
+        jx, jy = self.jitter_ndc
+        if jx or jy:
+            m[0, 2] += jx
+            m[1, 2] += jy
+        return m
 
     def view_proj(self, aspect: float) -> np.ndarray:
         return self.proj_matrix(aspect) @ self.view_matrix()

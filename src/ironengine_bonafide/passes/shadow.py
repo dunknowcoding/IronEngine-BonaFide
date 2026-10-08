@@ -34,6 +34,7 @@ from ironengine_bonafide.core.shadow import (
     build_cascades_with_info,
     compute_receiver_bias_world,
     ground_slope_texels,
+    vsm_moments_from_depth,
 )
 from ironengine_bonafide.passes.base import PassContext, RenderPass
 
@@ -109,6 +110,7 @@ class CsmShadowPass(RenderPass):
             float(getattr(cfg, "shadow_bias_slope", 1.0)) * 1.5)
 
         shadow_maps: list[ShadowMap] = []
+        vsm = str(getattr(cfg, "shadows", "csm")) == "vsm"
         for vp_np, z_n, z_f, frustum in cascades:
             vp = torch.from_numpy(vp_np).to(device=ctx.backend.device, dtype=torch.float32)
             depth = self._render_scene_depth(ctx, vp, res, res)
@@ -119,6 +121,20 @@ class CsmShadowPass(RenderPass):
                 override_world=override,
             )
             constant_world = min(constant_texels * frustum.texel_size_x, total_world)
+            if vsm:
+                # VSM: no baked bias (it would corrupt the moment
+                # statistics); the whole bias is applied at sampling time.
+                # The depth slot carries (E[z], E[z²]) moments instead.
+                moments = vsm_moments_from_depth(depth)
+                shadow_maps.append(ShadowMap(
+                    light_view_proj=vp, depth=moments, z_split_near=z_n, z_split_far=z_f,
+                    texel_size_world=frustum.texel_size_x, bias_world=0.0,
+                    receiver_bias_ndc=total_world * frustum.ndc_per_world,
+                    ndc_per_world=frustum.ndc_per_world,
+                    slope_scale=0.0,
+                    slope_tan_ref=ground_tan,
+                ))
+                continue
             baked_world = total_world - constant_world
             depth = bake_depth_bias(depth, frustum, baked_world)
             shadow_maps.append(ShadowMap(

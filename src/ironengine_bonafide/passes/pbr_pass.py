@@ -50,7 +50,7 @@ from ironengine_bonafide.core.light import (
     PointLight,
     SpotLight,
 )
-from ironengine_bonafide.core.shadow import ShadowMap, pcf_sample
+from ironengine_bonafide.core.shadow import ShadowMap, pcf_sample, vsm_visibility
 from ironengine_bonafide.logging import logger
 from ironengine_bonafide.passes.base import PassContext, RenderPass
 
@@ -152,7 +152,7 @@ class PbrPass(RenderPass):
             tan_buf = gb.tangent.to(out_device) if gb.tangent is not None else None
 
         # ---- Texture maps (need interpolated UVs) -------------------
-        rough_t = metal_t = ao_t = None
+        rough_t = metal_t = ao_t = emis_t = None
         if maps.any:
             if uv_buf is None:
                 ctx.skipped.append(f"pbr:{getattr(mesh, 'name', 'mesh')}_maps_no_uvs")
@@ -168,6 +168,11 @@ class PbrPass(RenderPass):
                     metal_t = (mr[..., 2] * float(mesh.material.metallic)).clamp(0.0, 1.0)
                 if maps.ao is not None:
                     ao_t = _sample_uv(maps.ao.to(albedo.device), uv_buf)[..., 0].clamp(0.0, 1.0)
+                if maps.emissive is not None:
+                    # glTF: emissive = emissiveFactor × emissiveTexture (sRGB-decoded).
+                    factor = torch.tensor(mesh.material.emissive, device=albedo.device,
+                                          dtype=albedo.dtype)
+                    emis_t = _sample_uv(maps.emissive.to(albedo.device), uv_buf) * factor
 
         # ---- Shade -------------------------------------------------
         shadow_maps: list[ShadowMap] = getattr(ctx.targets, "shadow_maps", []) or []
@@ -185,7 +190,7 @@ class PbrPass(RenderPass):
             shadow_maps=shadow_maps,
             material=mesh.material,
             cam_pos=_camera_position(ctx.camera, albedo.device, albedo.dtype),
-            rough=rough_t, metal=metal_t, ao=ao_t,
+            rough=rough_t, metal=metal_t, ao=ao_t, emis_map=emis_t,
             view_depth=view_depth,
         )
         if blend_alpha is not None:
@@ -278,6 +283,54 @@ def _schlick_g(cos_theta: torch.Tensor, k: torch.Tensor | float) -> torch.Tensor
     return cos_theta / (cos_theta * (1.0 - k) + k + 1e-9)
 
 
+_AREA_SAMPLES = 3                        # 3x3 stratified emitter quadrature
+
+
+def _area_light_contribution(lt, albedo, normals, view, world_pos, f0,   # type: ignore[no-untyped-def]
+                             metal3, alpha, *, device, dtype):
+    """Rectangular area light via stratified 3x3 quadrature.
+
+    The emitter rectangle (center ``lt.position``, facing ``lt.normal``,
+    side lengths ``lt.extent``) is sampled on a uniform grid; each sample
+    contributes ``intensity / S²`` with inverse-square falloff and a
+    one-sided emission test (the surface must lie in the hemisphere the
+    light faces). It is the honest classical approximation of the LTC
+    integral: wider extents give visibly softer, more spread shading, and
+    the zero-extent limit approaches a point light. (The previous
+    implementation shaded every area light as a bare point at its center,
+    ignoring ``extent`` entirely.)
+    """
+    light_pos = torch.tensor(lt.position, device=device, dtype=dtype)
+    ln = torch.tensor(lt.normal, device=device, dtype=dtype)
+    ln = ln / torch.linalg.norm(ln).clamp(min=1e-9)
+    anchor = torch.tensor(
+        (0.0, 1.0, 0.0) if abs(float(ln[1])) < 0.9 else (1.0, 0.0, 0.0),
+        device=device, dtype=dtype)
+    tu = torch.cross(ln, anchor, dim=-1)
+    tu = tu / torch.linalg.norm(tu).clamp(min=1e-9)
+    tv = torch.cross(ln, tu, dim=-1)
+    eu, ev = float(lt.extent[0]), float(lt.extent[1])
+    col = torch.tensor(lt.color, device=device, dtype=dtype)
+    s = _AREA_SAMPLES
+    total = torch.zeros_like(albedo)
+    for iu in range(s):
+        for iv in range(s):
+            du = (iu / (s - 1) - 0.5) * eu
+            dv = (iv / (s - 1) - 0.5) * ev
+            sp = light_pos + du * tu + dv * tv
+            to_light = sp - world_pos
+            dist2 = (to_light * to_light).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            dist = dist2.sqrt()
+            ldir = to_light / dist
+            # One-sided emission: only surfaces the light faces are lit.
+            facing = ((-ldir * ln).sum(dim=-1, keepdim=True)).clamp(min=0.0)
+            atten = 1.0 / (1.0 + dist2)
+            radiance = col * (float(lt.intensity) * facing * atten / (s * s))
+            total = total + _ggx_brdf(albedo, normals, view, ldir,
+                                      radiance, f0, metal3, alpha)
+    return total
+
+
 # ------------------------------------------------------------- IBL caching
 # Mip chains are built once per (IBL object, device) and reused — the
 # envmap is static for a scene, so this keeps per-frame cost to two
@@ -306,14 +359,15 @@ def _ibl_mips(ibl: IBL, device: torch.device | str, dtype: torch.dtype) -> list[
 def _shade_gbuffer(
     *, albedo, world_pos, normals, lights, ibl, mask, shadow_maps,
     material=None, cam_pos=None, rough=None, metal=None, ao=None,
-    view_depth=None,
+    emis_map=None, view_depth=None,
 ):                                                                       # type: ignore[no-untyped-def]
     """Apply Cook-Torrance GGX lights + ambient/IBL + CSM shadows to a
     GBuffer (HxWx3 each). ``material`` supplies scalar roughness /
-    metallic / emissive; ``rough`` / ``metal`` / ``ao`` are optional
-    per-pixel (H, W) overrides from texture maps. ``cam_pos`` is the
-    world-space eye position. ``view_depth`` is the optional per-pixel (H, W)
-    positive camera-space distance used for CSM cascade selection."""
+    metallic / emissive; ``rough`` / ``metal`` / ``ao`` / ``emis_map`` are
+    optional per-pixel (H, W[, 3]) overrides from texture maps. ``cam_pos``
+    is the world-space eye position. ``view_depth`` is the optional
+    per-pixel (H, W) positive camera-space distance used for CSM cascade
+    selection."""
     device, dtype = albedo.device, albedo.dtype
     h, w, _ = albedo.shape
     if rough is None:
@@ -395,21 +449,22 @@ def _shade_gbuffer(
             out = out + _ggx_brdf(albedo, normals, view, ldir, radiance, f0, metal3, alpha)
 
         elif isinstance(lt, AreaLight):
-            light_pos = torch.tensor(lt.position, device=device, dtype=dtype)
-            to_light = light_pos - world_pos
-            dist = torch.linalg.norm(to_light, dim=-1, keepdim=True).clamp(min=1e-3)
-            ldir = to_light / dist
-            col = torch.tensor(lt.color, device=device, dtype=dtype)
-            radiance = col * lt.intensity
-            out = out + _ggx_brdf(albedo, normals, view, ldir, radiance, f0, metal3, alpha)
+            out = out + _area_light_contribution(
+                lt, albedo, normals, view, world_pos, f0, metal3, alpha,
+                device=device, dtype=dtype,
+            )
 
         elif isinstance(lt, IBL):
             # IBL handled above; skip here to avoid double-counting.
             continue
 
-    emissive = getattr(material, "emissive", None)
-    if emissive is not None and any(float(c) != 0.0 for c in emissive):
-        out = out + torch.tensor(emissive, device=device, dtype=dtype)
+    if emis_map is not None:
+        # Per-pixel emissive (already multiplied by the material factor).
+        out = out + emis_map
+    else:
+        emissive = getattr(material, "emissive", None)
+        if emissive is not None and any(float(c) != 0.0 for c in emissive):
+            out = out + torch.tensor(emissive, device=device, dtype=dtype)
 
     return out * mask.unsqueeze(-1)
 
@@ -459,6 +514,15 @@ def _shadow_factor_csm(world_pos: torch.Tensor, shadow_maps: list[ShadowMap],
         uv = (ndc[:, :2] * 0.5 + 0.5)
         cur_z = ndc[:, 2]
         bias = float(getattr(sm, "receiver_bias_ndc", 0.0) or 0.0)
+        if sm.depth.ndim == 3:
+            # VSM: depth slot carries blurred (E[z], E[z²]) moments; the
+            # Chebyshev test yields fractional visibility (soft penumbra).
+            lit = vsm_visibility(sm.depth, uv, cur_z, bias=bias)
+            vis_flat = visibility.flatten()
+            target = in_cascade & (vis_flat == 1.0)
+            vis_flat[target] = lit[target]
+            visibility = vis_flat.reshape(h, w)
+            continue
         pcf_kw: dict = {}
         if nrm_flat is not None and getattr(sm, "slope_scale", 0.0) > 0.0:
             pcf_kw = dict(
@@ -508,11 +572,13 @@ class _MaterialMaps:
     normal: torch.Tensor | None = None               # (H, W, 3) tangent-space
     metallic_roughness: torch.Tensor | None = None   # (H, W, 3) glTF: G=rough, B=metal
     ao: torch.Tensor | None = None                   # (H, W, 3) R channel used
+    emissive: torch.Tensor | None = None             # (H, W, 3) linear HDR tint
 
     @property
     def any(self) -> bool:
         return (self.albedo is not None or self.normal is not None
-                or self.metallic_roughness is not None or self.ao is not None)
+                or self.metallic_roughness is not None or self.ao is not None
+                or self.emissive is not None)
 
     @classmethod
     def load(cls, material) -> _MaterialMaps:        # type: ignore[no-untyped-def]
@@ -522,6 +588,7 @@ class _MaterialMaps:
             metallic_roughness=_load_texture(
                 getattr(material, "metallic_roughness_map", None), srgb=False),
             ao=_load_texture(getattr(material, "ao_map", None), srgb=False),
+            emissive=_load_texture(getattr(material, "emissive_map", None), srgb=True),
         )
 
 

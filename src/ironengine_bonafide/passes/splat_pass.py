@@ -68,6 +68,8 @@ class SplatPass(RenderPass):
             else _default_color(positions)
         )
         normals = cloud.normals
+        if normals is not None:
+            normals = normals.to(positions.device)   # LOD indexing needs same device
         opacities = (
             cloud.opacities.to(ctx.backend.device)
             if getattr(cloud, "opacities", None) is not None

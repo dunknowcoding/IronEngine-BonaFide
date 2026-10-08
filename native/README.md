@@ -11,7 +11,7 @@ The Python engine works without this. When it's built and importable
 | Async asset upload      | overlaps host→device with compute         |
 
 > **Stale-build quarantine (W28):** the old `native/build/` tree was linked
-> against a dead env path (`G_\Anaconda\...`) and never imported. It has
+> against a stale environment path and never imported. It has
 > been moved to `native/_stale_build_quarantined/` — do not install from
 > it; rebuild fresh per below. The import guard in
 > `backends/cuda/native_bridge.py` (`HAS_NATIVE=False` + warning) is the
@@ -31,7 +31,7 @@ It probes and reports each item below. Fix any failing line and re-run.
 
 | Requirement              | Linux                                | Windows                                                |
 |--------------------------|--------------------------------------|--------------------------------------------------------|
-| Python ≥ 3.11            | conda env (`IronEngineWorld`)        | conda env (`IronEngineWorld`)                          |
+| Python ≥ 3.11            | conda / venv                         | conda / venv                                           |
 | CMake ≥ 3.24             | `apt install cmake` / `conda install cmake` | https://cmake.org/download/                  |
 | CUDA toolkit ≥ 11.7      | NVIDIA `.run` installer or `apt`     | NVIDIA `.exe` installer                                |
 | Host C++ compiler        | `g++` from `build-essential`         | **VS 2022 Build Tools** with the *Desktop development with C++* workload |
@@ -51,8 +51,8 @@ It probes and reports each item below. Fix any failing line and re-run.
    `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7\extras\visual_studio_integration\MSBuildExtensions\`
    into the `BuildCustomizations` directory.
 3. **Multiple `cmake` installs**: the build-doctor will warn if it picks up a
-   non-standard CMake (e.g. one shipped with STM32CubeCLT). Put your preferred
-   `cmake` first on `PATH`.
+   non-standard CMake (e.g. one bundled with another vendor toolchain). Put
+   your preferred `cmake` first on `PATH`.
 
 ---
 
@@ -68,7 +68,7 @@ This is the **validated** Windows path. It:
 
 1. Activates the VS 2022 Build Tools x64 environment (`vcvarsall.bat x64`).
 2. Puts a known-good CMake + Ninja first on `PATH` so a stray MinGW gcc or
-   STM32CubeCLT toolchain doesn't win the compiler-detection race.
+   another vendor toolchain doesn't win the compiler-detection race.
 3. Builds with the **Ninja** generator — no VS `.props` CUDA integration
    required, sidestepping the "No CUDA toolset found" failure mode.
 4. Exports `NVCC_PREPEND_FLAGS` to bridge the **CUDA 11.7 ↔ MSVC 19.44

@@ -18,13 +18,19 @@ Correctness notes (vs. the previous version):
   legacy callers; emissiveFactor maps to ``PBRMaterial.emissive``.
 * ``COLOR_0`` vertex colors are loaded when present.
 
-Embedded **base-color textures are resolved**: PNG/JPEG images carried in the
-GLB binary chunk (``bufferView`` images), as ``data:`` URIs, or referenced by a
-relative URI are decoded to a deterministic temp-cache file and bound to
-``PBRMaterial.albedo_map``, which the CPU PBR pass samples (``baseColorFactor``
-still multiplies, per spec). Normal / metallic-roughness / occlusion /
-emissive texture references, KTX2 sources, sampler wrap/filter modes, and
-``KHR_texture_transform`` are not resolved yet.
+Embedded textures are resolved for **all five PBR slots** — base color,
+normal, metallic-roughness, occlusion, and emissive — whether carried in
+the GLB binary chunk (``bufferView`` images), as ``data:`` URIs, or
+referenced by a relative URI. Decoded bytes are written to a deterministic
+temp-cache file and bound to the matching ``PBRMaterial`` map slot, which
+the CPU PBR pass samples (factor values still multiply, per spec).
+``KHR_texture_transform`` is honored by baking the UV affine
+(offset/scale/rotation) into the primitive's UVs when every textured slot
+of the material shares one transform; conflicting transforms keep the
+base-color one and log a warning. KTX2 sources (``KHR_texture_basisu``)
+require the ``[formats]`` extra and are skipped with a warning otherwise;
+sampler wrap/filter modes are not applied (sampling always repeats with
+bilinear filtering) and only ``TEXCOORD_0`` is used.
 """
 from __future__ import annotations
 
@@ -205,16 +211,18 @@ def _cache_texture_bytes(raw: bytes, glb_path: Path, image_idx: int, mime: str) 
     return str(out)
 
 
-def _base_color_texture_path(gltf: object, buffers: list[bytes], path: Path, pbr: Any) -> str | None:
-    """Resolve ``pbrMetallicRoughness.baseColorTexture`` to a filesystem path
-    the PBR pass can sample, or None when it cannot be resolved.
+def _texture_path(gltf: object, buffers: list[bytes], path: Path,
+                  info: Any, *, slot: str) -> str | None:
+    """Resolve any glTF texture-info (baseColor / normal / MR / occlusion /
+    emissive) to a filesystem path the PBR pass can sample, or None when it
+    cannot be resolved.
 
     Embedded images (GLB ``bufferView`` or ``data:`` URI) are decoded to a
-    temp-cache file; relative URIs resolve against the GLB's folder. Sampler
-    wrap/filter settings and ``KHR_texture_transform`` are ignored — sampling
-    always repeats with bilinear filtering.
+    temp-cache file; relative URIs resolve against the GLB's folder. KTX2
+    sources log a warning and return None (the ``[formats]`` extra ships a
+    KTX2 loader for filesystem refs). Sampler wrap/filter settings are
+    ignored — sampling always repeats with bilinear filtering.
     """
-    info = pbr.baseColorTexture
     if info is None or info.index is None:
         return None
     textures = getattr(gltf, "textures", None) or []
@@ -225,6 +233,11 @@ def _base_color_texture_path(gltf: object, buffers: list[bytes], path: Path, pbr
     if src is None or src >= len(images):
         return None
     img = images[src]
+    mime = (img.mimeType or "").lower()
+    if mime == "image/ktx2":
+        from ironengine_bonafide.logging import logger
+        logger.warning(f"gltf: KTX2 {slot} texture skipped (needs the [formats] extra)")
+        return None
     if img.uri:
         if img.uri.startswith("data:"):
             header, _, payload = img.uri.partition(",")
@@ -245,13 +258,65 @@ def _base_color_texture_path(gltf: object, buffers: list[bytes], path: Path, pbr
     return None
 
 
+def _base_color_texture_path(gltf: object, buffers: list[bytes], path: Path, pbr: Any) -> str | None:
+    """Back-compat wrapper — resolves ``pbrMetallicRoughness.baseColorTexture``."""
+    info = getattr(pbr, "baseColorTexture", None)
+    return _texture_path(gltf, buffers, path, info, slot="baseColor")
+
+
+# ------------------------------------------------------- KHR_texture_transform
+@dataclass(slots=True)
+class UvTransform:
+    """``KHR_texture_transform`` affine: uv' = T(offset) · R(rotation) · S(scale) · uv."""
+    offset: tuple[float, float] = (0.0, 0.0)
+    scale: tuple[float, float] = (1.0, 1.0)
+    rotation: float = 0.0
+
+    def is_identity(self) -> bool:
+        return (self.offset == (0.0, 0.0) and self.scale == (1.0, 1.0)
+                and self.rotation == 0.0)
+
+    def apply(self, uv: np.ndarray) -> np.ndarray:
+        su, sv = self.scale
+        c, s = math.cos(self.rotation), math.sin(self.rotation)
+        x = uv[:, 0] * su
+        y = uv[:, 1] * sv
+        out = np.empty_like(uv)
+        out[:, 0] = c * x - s * y + self.offset[0]
+        out[:, 1] = s * x + c * y + self.offset[1]
+        return out
+
+
+def _uv_transform_of(info: Any) -> UvTransform | None:
+    """Extract KHR_texture_transform from a texture-info, or None."""
+    if info is None:
+        return None
+    ext = getattr(info, "extensions", None) or {}
+    tr = ext.get("KHR_texture_transform")
+    if not tr:
+        return None
+    if int(getattr(info, "texCoord", 0) or 0) != 0:
+        # Only TEXCOORD_0 exists on our Mesh; alternate UV sets are dropped.
+        return None
+    return UvTransform(
+        offset=tuple(float(v) for v in tr.get("offset", (0.0, 0.0))),  # type: ignore[arg-type]
+        scale=tuple(float(v) for v in tr.get("scale", (1.0, 1.0))),    # type: ignore[arg-type]
+        rotation=float(tr.get("rotation", 0.0)),
+    )
+
+
 # --------------------------------------------------------------- materials
 def _material_for(
     gltf: object, mat_idx: int | None, buffers: list[bytes], path: Path,
-) -> tuple[PBRMaterial, float, bool]:
-    """→ (PBRMaterial, baseColor alpha, double_sided)."""
+) -> tuple[PBRMaterial, float, bool, UvTransform | None]:
+    """→ (PBRMaterial, baseColor alpha, double_sided, uv_transform).
+
+    All five texture slots are resolved; ``uv_transform`` is the shared
+    KHR_texture_transform to bake into the primitive's UVs (None when no
+    textured slot uses it).
+    """
     if mat_idx is None:
-        return PBRMaterial(name="default"), 1.0, False
+        return PBRMaterial(name="default"), 1.0, False, None
     m = gltf.materials[mat_idx]                               # type: ignore[attr-defined]
     pbr = m.pbrMetallicRoughness
     albedo: tuple[float, float, float] | None = None
@@ -259,6 +324,7 @@ def _material_for(
     roughness = 0.7
     metallic = 0.0
     albedo_map: str | None = None
+    mr_map: str | None = None
     if pbr is not None:
         if pbr.baseColorFactor is not None:
             albedo = tuple(float(c) for c in pbr.baseColorFactor[:3])  # type: ignore[assignment]
@@ -267,7 +333,17 @@ def _material_for(
             roughness = float(pbr.roughnessFactor)
         if pbr.metallicFactor is not None:
             metallic = float(pbr.metallicFactor)
-        albedo_map = _base_color_texture_path(gltf, buffers, path, pbr)
+        albedo_map = _texture_path(gltf, buffers, path,
+                                   getattr(pbr, "baseColorTexture", None), slot="baseColor")
+        mr_map = _texture_path(gltf, buffers, path,
+                               getattr(pbr, "metallicRoughnessTexture", None),
+                               slot="metallicRoughness")
+    normal_map = _texture_path(gltf, buffers, path,
+                               getattr(m, "normalTexture", None), slot="normal")
+    ao_map = _texture_path(gltf, buffers, path,
+                           getattr(m, "occlusionTexture", None), slot="occlusion")
+    emissive_map = _texture_path(gltf, buffers, path,
+                                 getattr(m, "emissiveTexture", None), slot="emissive")
     if albedo is None:
         # glTF's default baseColorFactor is white — it multiplies the texture.
         # Only use the neutral gray fallback when there is no texture at all.
@@ -275,15 +351,57 @@ def _material_for(
     emissive = (0.0, 0.0, 0.0)
     if m.emissiveFactor is not None:
         emissive = tuple(float(c) for c in m.emissiveFactor[:3])       # type: ignore[assignment]
+    # KHR_materials_emissive_strength scales the whole emissive term; baking
+    # it into the factor covers both the scalar and the texture paths
+    # (emissive = factor × emissiveTexture × strength, per spec).
+    m_ext = getattr(m, "extensions", None) or {}
+    strength = (m_ext.get("KHR_materials_emissive_strength") or {}).get("emissiveStrength")
+    if strength is not None:
+        emissive = tuple(min(1e6, c * float(strength)) for c in emissive)  # type: ignore[assignment]
+
+    # KHR_texture_transform: usable only when every textured slot agrees on
+    # a single transform (our Mesh carries one UV set).
+    transforms = [
+        t for t in (
+            _uv_transform_of(getattr(pbr, "baseColorTexture", None)) if pbr else None,
+            _uv_transform_of(getattr(pbr, "metallicRoughnessTexture", None)) if pbr else None,
+            _uv_transform_of(getattr(m, "normalTexture", None)),
+            _uv_transform_of(getattr(m, "occlusionTexture", None)),
+            _uv_transform_of(getattr(m, "emissiveTexture", None)),
+        )
+        if t is not None and not t.is_identity()
+    ]
+    uv_transform: UvTransform | None = None
+    if transforms:
+        first = transforms[0]
+        same = all(
+            t.offset == first.offset and t.scale == first.scale
+            and t.rotation == first.rotation
+            for t in transforms
+        )
+        if same:
+            uv_transform = first
+        else:
+            from ironengine_bonafide.logging import logger
+            logger.warning(
+                "gltf: conflicting KHR_texture_transform across texture slots; "
+                "baking the base-color transform only"
+            )
+            uv_transform = first
+
     return (
         PBRMaterial(
             name=m.name or "default",
             albedo=albedo, roughness=roughness, metallic=metallic,
-            emissive=emissive, albedo_map=albedo_map, two_sided=bool(m.doubleSided),
+            emissive=emissive, albedo_map=albedo_map,
+            metallic_roughness_map=mr_map, normal_map=normal_map,
+            ao_map=ao_map, emissive_map=emissive_map,
+            two_sided=bool(m.doubleSided),
             alpha=alpha,
         ),
         alpha,
         bool(m.doubleSided),
+        uv_transform,
     )
 
 
@@ -324,7 +442,10 @@ def load_primitives(path: Path) -> list[GltfPrimitive]:
             else:
                 idx = np.arange(pos.shape[0], dtype=np.int64).reshape(-1, 3)
 
-            material, alpha, double_sided = _material_for(gltf, prim.material, buffers, path)
+            material, alpha, double_sided, uv_transform = _material_for(
+                gltf, prim.material, buffers, path)
+            if uv_transform is not None and uvs is not None:
+                uvs = uv_transform.apply(uvs.astype(np.float64)).astype(np.float32)
             primitives.append(GltfPrimitive(
                 mesh=Mesh.from_arrays(
                     pos, idx, normals=normals, uvs=uvs, colors=colors,

@@ -9,7 +9,7 @@ Activates with:
 **Safe default.** ``install(headless_only=True)`` (the default) patches ONLY
 ``RenderWorld.render_sensor_rgb`` / ``render_sensor_depth``. The viewport
 keeps Sim's own ModernGL renderer, so installing the shim can never blind
-the SceneEditor viewport. Passing ``headless_only=False`` additionally
+the editor viewport. Passing ``headless_only=False`` additionally
 replaces ``render_viewport``: BonaFide renders the frame and stashes the
 uint8 RGB image on ``render_world._last_bonafide_frame`` — blitting it into
 the Qt/ModernGL framebuffer is the caller's responsibility (opt into this
@@ -650,7 +650,7 @@ def install(headless_only: bool = True) -> None:
 
     ``headless_only=True`` (default, safe): patches ONLY the sensor methods
     (``render_sensor_rgb`` / ``render_sensor_depth``); the viewport keeps
-    Sim's own renderer so the SceneEditor can never go black.
+    Sim's own renderer so the editor can never go black.
 
     ``headless_only=False``: additionally replaces ``render_viewport``.
     The BonaFide frame is exposed via ``render_world._last_bonafide_frame``

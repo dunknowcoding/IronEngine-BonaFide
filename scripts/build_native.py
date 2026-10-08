@@ -61,7 +61,7 @@ def check_python() -> CheckResult:
     return CheckResult(
         "Python ≥ 3.11", ok,
         detail=f"{platform.python_version()} at {sys.executable}",
-        fix="Activate the IronEngineWorld conda env (Python 3.11)." if not ok else "",
+        fix="Use a Python 3.11+ environment (conda or venv)." if not ok else "",
     )
 
 
