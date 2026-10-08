@@ -166,11 +166,12 @@ def test_no_nan_anywhere_on_stress_scene() -> None:
 # ------------------------------------------------------------ bundle fidelity
 def test_bundle_preserves_uvs_and_textured_render(tmp_path: Path) -> None:
     pytest.importorskip("pygltflib")
+    from _glb_factory import build_full_glb
+
     from ironengine_bonafide.assets.loaders.gltf import load_primitives
-    from tests.test_gltf_full_textures import _build_full_glb
 
     glb = tmp_path / "full.glb"
-    _build_full_glb(glb)
+    build_full_glb(glb)
     prim = load_primitives(glb)[0]
     assert prim.mesh.uvs is not None
 
